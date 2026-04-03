@@ -74,6 +74,12 @@ function showView(name) {
     const el = qs(`#view-${name}`);
     if (el) el.style.display = '';
 
+    // Cancel gallery thumbnails when leaving gallery
+    if (name !== 'gallery' && galleryAbort) {
+        galleryAbort.abort();
+        galleryAbort = null;
+    }
+
     if (name === 'gallery' && S.imageId) loadGallery();
 }
 
@@ -293,40 +299,156 @@ async function startExport() {
 
 /* ─── Gallery ────────────────────────────────────────── */
 
-function loadGallery() {
+let galleryPrintStocks = {};
+let galleryPrintFilter = 'all'; // 'all' = all prints (default), '' = default only, or a specific print key
+let galleryAbort = null; // AbortController to cancel pending thumbnail fetches
+
+async function loadGallery() {
+    // Load print stocks for filter tabs if not yet loaded
+    if (Object.keys(galleryPrintStocks).length === 0) {
+        const data = await fetch('/api/print-stocks').then(r => r.json());
+        galleryPrintStocks = data;
+        buildGalleryPrintTabs();
+    }
+    renderGallery();
+}
+
+function buildGalleryPrintTabs() {
+    const tabs = qs('#gallery-print-tabs');
+    tabs.innerHTML = '';
+
+    const options = [
+        { key: '', label: 'Default' },
+        { key: 'all', label: 'All Prints' },
+        ...Object.entries(galleryPrintStocks).map(([k, name]) => ({
+            key: k, label: name.replace(/\s*\(.*\)/, '') // strip parenthetical
+        })),
+    ];
+
+    for (const opt of options) {
+        const btn = document.createElement('button');
+        btn.className = 'gal-print-tab' + (opt.key === galleryPrintFilter ? ' active' : '');
+        btn.textContent = opt.label;
+        btn.dataset.print = opt.key;
+        btn.addEventListener('click', () => {
+            galleryPrintFilter = opt.key;
+            tabs.querySelectorAll('.gal-print-tab').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            renderGallery();
+        });
+        tabs.appendChild(btn);
+    }
+}
+
+function renderGallery() {
+    // Cancel any in-flight thumbnail fetches
+    if (galleryAbort) galleryAbort.abort();
+    galleryAbort = new AbortController();
+
     const grid = qs('#gallery-grid');
     grid.innerHTML = '';
-    qs('#gallery-count').textContent = S.galleryStocks.length;
 
-    for (const stock of S.galleryStocks) {
-        const card = document.createElement('div');
-        card.className = 'gal-card loading';
-        card.innerHTML = `
-            <img src="" alt="${stock.name}">
-            <div class="gal-info">
-                <span class="gal-name">${stock.name}</span>
-                <span class="gal-cat">${stock.category}</span>
-            </div>`;
-        card.addEventListener('click', () => {
-            S.stock = stock.key;
-            S.category = stock.category;
-            renderCats('#cat-tabs', S.category, key => { S.category = key; renderStocks('#stock-list', S.stock, selectStock); });
-            renderStocks('#stock-list', S.stock, selectStock);
-            enterApp('compare');
-            requestPreview();
-        });
-        grid.appendChild(card);
-
-        // Lazy-load thumbnail
-        const img = card.querySelector('img');
-        fetch(`/api/thumbnail/${S.imageId}?stock=${stock.key}`)
-            .then(r => r.blob())
-            .then(blob => {
-                img.src = URL.createObjectURL(blob);
-                card.classList.remove('loading');
-            })
-            .catch(() => card.classList.remove('loading'));
+    if (galleryPrintFilter === 'all') {
+        renderGalleryAllPrints(grid);
+    } else {
+        renderGalleryFiltered(grid, galleryPrintFilter || null);
     }
+}
+
+function renderGalleryFiltered(grid, printKey) {
+    const stocks = S.galleryStocks;
+    // If a specific print is selected, only show mixable stocks
+    const filtered = printKey ? stocks.filter(s => MIXABLE_CATS.has(s.category)) : stocks;
+    qs('#gallery-count').textContent = filtered.length;
+
+    const printLabel = printKey ? galleryPrintStocks[printKey].replace(/\s*\(.*\)/, '') : '';
+    for (const stock of filtered) {
+        grid.appendChild(makeGalleryCard(stock, printKey, printLabel));
+    }
+}
+
+// Categories that support print stock mixing (color negatives only)
+const MIXABLE_CATS = new Set(['pro_color', 'consumer', 'cinema', 'vintage_cinema']);
+
+function renderGalleryAllPrints(grid) {
+    const stocks = S.galleryStocks;
+    const printKeys = Object.keys(galleryPrintStocks);
+    let totalCount = 0;
+
+    // First: all stocks with default print
+    const defaultHead = document.createElement('div');
+    defaultHead.className = 'gallery-section-head';
+    defaultHead.innerHTML = '<em>Default</em> print stock per film';
+    grid.appendChild(defaultHead);
+
+    for (const stock of stocks) {
+        grid.appendChild(makeGalleryCard(stock, null, ''));
+        totalCount++;
+    }
+
+    // Then: each print stock section (only color negatives — skip B&W, reversal, instant)
+    for (const pk of printKeys) {
+        const pname = galleryPrintStocks[pk].replace(/\s*\(.*\)/, '');
+        const mixable = stocks.filter(s => MIXABLE_CATS.has(s.category));
+        if (mixable.length === 0) continue;
+
+        const head = document.createElement('div');
+        head.className = 'gallery-section-head';
+        head.innerHTML = `<em>${pname}</em>`;
+        grid.appendChild(head);
+
+        for (const stock of mixable) {
+            grid.appendChild(makeGalleryCard(stock, pk, pname));
+            totalCount++;
+        }
+    }
+
+    qs('#gallery-count').textContent = totalCount;
+}
+
+function makeGalleryCard(stock, printKey, printLabel) {
+    const card = document.createElement('div');
+    card.className = 'gal-card loading';
+
+    const subtitle = printLabel ? `${stock.category} · ${printLabel}` : stock.category;
+    card.innerHTML = `
+        <img src="" alt="${stock.name}">
+        <div class="gal-info">
+            <span class="gal-name">${stock.name}</span>
+            <span class="gal-cat">${subtitle}</span>
+        </div>`;
+
+    card.addEventListener('click', () => {
+        S.stock = stock.key;
+        S.category = stock.category;
+        if (printKey) {
+            S.printStock = printKey;
+            qs('#print-stock').value = printKey;
+        } else {
+            S.printStock = null;
+            qs('#print-stock').value = '';
+        }
+        renderCats('#cat-tabs', S.category, key => { S.category = key; renderStocks('#stock-list', S.stock, selectStock); });
+        renderStocks('#stock-list', S.stock, selectStock);
+        enterApp('compare');
+        requestPreview();
+    });
+
+    // Lazy-load thumbnail (cancellable)
+    const img = card.querySelector('img');
+    const printParam = printKey ? `&print_stock=${printKey}` : '';
+    const signal = galleryAbort ? galleryAbort.signal : undefined;
+    fetch(`/api/thumbnail/${S.imageId}?stock=${stock.key}${printParam}`, { signal })
+        .then(r => r.blob())
+        .then(blob => {
+            img.src = URL.createObjectURL(blob);
+            card.classList.remove('loading');
+        })
+        .catch(e => {
+            if (e.name !== 'AbortError') card.classList.remove('loading');
+        });
+
+    return card;
 }
 
 /* ─── Batch ──────────────────────────────────────────── */

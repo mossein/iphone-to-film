@@ -133,8 +133,16 @@
 <!-- ═══ GALLERY VIEW ═══ -->
 <div id="view-gallery" class="view" style="display:none">
     <div class="gallery-header">
-        <h2>Contact Sheet &mdash; <span id="gallery-count">0</span> stocks</h2>
+        <h2>Contact Sheet &mdash; <span id="gallery-count">0</span> combinations</h2>
         <p class="gallery-sub">Click any frame to open in Compare view</p>
+    </div>
+    <div class="gallery-filters">
+        <div class="gallery-filter-group">
+            <span class="filter-label">Print Stock:</span>
+            <div class="gallery-print-tabs" id="gallery-print-tabs">
+                <button class="gal-print-tab" data-print="">Default Only</button>
+            </div>
+        </div>
     </div>
     <div class="gallery-grid" id="gallery-grid"></div>
 </div>
