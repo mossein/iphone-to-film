@@ -1,5 +1,8 @@
 # iPhone to Analog Film — The Hard Way
 
+> *Photochemical reactions vs photons and circuitry. This is a hot debate... but many believe (myself included) that we can emulate all the qualities of film with digital capture. It's just a matter of knowing how, and putting in the work.*
+> — [@imPatrickT](https://x.com/imPatrickT)
+
 I wanted my iPhone photos to look like they were shot on real 35mm film. Not the VSCO/Instagram "film look" — I mean actually indistinguishable from analog. The kind of thing where someone asks "what camera is that?"
 
 Turns out, everyone who's tried this has been doing it wrong. Including me, for the first four attempts.

@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FILM — Spectral Emulation</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- ═══ TOP BAR ═══ -->
+<nav id="topbar">
+    <div class="brand">
+        <span class="wordmark">FILM</span>
+        <span class="tagline">spectral negative&thinsp;&rarr;&thinsp;print emulation</span>
+    </div>
+    <div class="view-switcher" id="view-switcher">
+        <button class="vs-btn active" data-view="compare">Compare</button>
+        <button class="vs-btn" data-view="gallery">Gallery</button>
+        <button class="vs-btn" data-view="batch">Batch</button>
+    </div>
+    <div class="nav-right">
+        <label class="upload-trigger" id="nav-upload-trigger">
+            <span>+ Upload</span>
+            <input type="file" id="file-input" accept="image/*" hidden>
+        </label>
+    </div>
+</nav>
+
+<!-- ═══ LANDING / UPLOAD ═══ -->
+<main id="landing">
+    <div class="landing-inner">
+        <div class="landing-hero">
+            <h1><em>Photochemical</em> precision,<br>not colour grading.</h1>
+            <p>50 film stocks modelled from manufacturer datasheets.<br>Drag a photo to begin.</p>
+        </div>
+        <div class="drop-zone" id="drop-zone">
+            <div class="drop-zone-inner">
+                <div class="aperture-icon">
+                    <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.2">
+                        <circle cx="24" cy="24" r="22"/>
+                        <path d="M24 2 L28 18"/>
+                        <path d="M43 13 L30 22"/>
+                        <path d="M43 35 L28 26"/>
+                        <path d="M24 46 L20 30"/>
+                        <path d="M5 35 L18 26"/>
+                        <path d="M5 13 L18 22"/>
+                    </svg>
+                </div>
+                <span class="drop-text">Drop image here or <u>browse</u></span>
+                <span class="drop-formats">JPEG &middot; PNG &middot; HEIC &middot; TIFF</span>
+            </div>
+        </div>
+    </div>
+</main>
+
+<!-- ═══ COMPARE VIEW ═══ -->
+<div id="view-compare" class="view" style="display:none">
+    <div class="compare-layout">
+        <!-- Sidebar -->
+        <aside class="sidebar" id="sidebar">
+            <section>
+                <div class="section-head">Film Stock</div>
+                <div class="cat-tabs" id="cat-tabs"></div>
+                <div class="stock-list" id="stock-list"></div>
+            </section>
+            <section>
+                <div class="section-head">Print Stock <span class="dim">(Recipe)</span></div>
+                <select id="print-stock" class="ctrl-select">
+                    <option value="">Default for this stock</option>
+                </select>
+            </section>
+            <section>
+                <div class="section-head">Parameters</div>
+                <div class="params-grid">
+                    <div class="prm" data-param="exp_comp">
+                        <div class="prm-head"><span>Exposure</span><span class="prm-val">0.0</span></div>
+                        <input type="range" min="-2" max="2" step="0.1" value="0" data-decimals="1">
+                    </div>
+                    <div class="prm" data-param="sat">
+                        <div class="prm-head"><span>Saturation</span><span class="prm-val">1.00</span></div>
+                        <input type="range" min="0.8" max="1.3" step="0.02" value="1.0" data-decimals="2">
+                    </div>
+                    <div class="prm" data-param="pre_flash_neg">
+                        <div class="prm-head"><span>Shadow Lift</span><span class="prm-val">-4.0</span></div>
+                        <input type="range" min="-4" max="-1" step="0.1" value="-4" data-decimals="1">
+                    </div>
+                    <div class="prm" data-param="black_offset">
+                        <div class="prm-head"><span>Black Level</span><span class="prm-val">0.0</span></div>
+                        <input type="range" min="-5" max="5" step="0.5" value="0" data-decimals="1">
+                    </div>
+                    <div class="prm" data-param="white_point">
+                        <div class="prm-head"><span>Highlight Roll</span><span class="prm-val">1.00</span></div>
+                        <input type="range" min="0.85" max="1.0" step="0.01" value="1.0" data-decimals="2">
+                    </div>
+                    <div class="prm" data-param="tint">
+                        <div class="prm-head"><span>Color Tint</span><span class="prm-val">0.0</span></div>
+                        <input type="range" min="-10" max="10" step="0.5" value="0" data-decimals="1">
+                    </div>
+                </div>
+            </section>
+        </aside>
+
+        <!-- Compare canvas -->
+        <div class="compare-main">
+            <div class="compare-container" id="compare-container">
+                <img id="img-original" class="cmp-img cmp-original" alt="">
+                <img id="img-processed" class="cmp-img cmp-processed" alt="">
+                <div class="cmp-divider" id="cmp-divider"></div>
+                <span class="cmp-label cmp-label-l">ORIGINAL</span>
+                <span class="cmp-label cmp-label-r" id="cmp-stock-label">PORTRA 400</span>
+                <div class="cmp-loader" id="cmp-loader">
+                    <div class="cmp-spinner"></div>
+                    <span id="cmp-loader-text">Processing&hellip;</span>
+                </div>
+            </div>
+
+            <!-- Bottom export bar -->
+            <div class="export-bar" id="export-bar">
+                <button class="btn-export" id="btn-export">Export Full Resolution</button>
+                <div class="export-progress" id="export-progress">
+                    <div class="export-fill" id="export-fill"></div>
+                </div>
+                <span class="export-step" id="export-step"></span>
+                <div class="export-downloads" id="export-downloads"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ═══ GALLERY VIEW ═══ -->
+<div id="view-gallery" class="view" style="display:none">
+    <div class="gallery-header">
+        <h2>Contact Sheet &mdash; <span id="gallery-count">0</span> stocks</h2>
+        <p class="gallery-sub">Click any frame to open in Compare view</p>
+    </div>
+    <div class="gallery-grid" id="gallery-grid"></div>
+</div>
+
+<!-- ═══ BATCH VIEW ═══ -->
+<div id="view-batch" class="view" style="display:none">
+    <div class="batch-layout">
+        <div class="batch-left">
+            <h2>Batch Process</h2>
+            <p class="batch-sub">Drop multiple photos, pick a stock, process all at once.</p>
+
+            <div class="batch-drop" id="batch-drop">
+                <span>Drop files here or <u>browse</u></span>
+                <input type="file" id="batch-file-input" accept="image/*" multiple hidden>
+            </div>
+
+            <div class="batch-file-list" id="batch-file-list"></div>
+
+            <div class="batch-stock-pick">
+                <div class="section-head">Film Stock</div>
+                <div class="cat-tabs" id="batch-cat-tabs"></div>
+                <div class="stock-list batch-stock-list" id="batch-stock-list"></div>
+            </div>
+
+            <div class="batch-actions">
+                <button class="btn-export" id="batch-go" disabled>Process All</button>
+                <div class="batch-progress-wrap" id="batch-progress-wrap" style="display:none">
+                    <div class="export-progress"><div class="export-fill" id="batch-fill"></div></div>
+                    <span class="export-step" id="batch-step"></span>
+                </div>
+                <a class="btn-dl" id="batch-dl" style="display:none" download>Download ZIP</a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
