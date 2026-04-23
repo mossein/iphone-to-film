@@ -1,6 +1,8 @@
 """Batch route — process multiple images with one stock."""
 
 import uuid
+import time
+import logging
 import threading
 from pathlib import Path
 from fastapi import APIRouter, Query, UploadFile, File
@@ -8,9 +10,14 @@ from fastapi.responses import JSONResponse, FileResponse
 import shutil
 import zipfile
 import io
+from PIL import Image, ImageOps
+from pillow_heif import register_heif_opener
 
 from core.stocks import get_stock
 from core.pipeline import process
+
+register_heif_opener()
+log = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -19,6 +26,15 @@ OUTPUT_DIR = Path(__file__).parent.parent / "output"
 
 # Batch job tracking
 _batch_jobs = {}
+_BATCH_TTL = 3600
+
+
+def _cleanup_old_batch_jobs():
+    now = time.time()
+    expired = [k for k, v in _batch_jobs.items()
+               if v.get("status") in ("done", "error") and now - v.get("created_at", now) > _BATCH_TTL]
+    for k in expired:
+        del _batch_jobs[k]
 
 
 def _run_batch(batch_id, image_paths, stock_key, include_border):
@@ -53,14 +69,45 @@ async def batch_upload(files: list[UploadFile] = File(...)):
     batch_id = str(uuid.uuid4())[:8]
     image_paths = []
 
+    from web.routes.upload import RAW_EXTS, _demosaic_raw
     for file in files:
         ext = Path(file.filename).suffix.lower()
-        if ext not in (".jpg", ".jpeg", ".png", ".heic", ".tiff", ".tif"):
+        if ext not in (".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff", ".tif") + RAW_EXTS:
             continue
         image_id = str(uuid.uuid4())
-        save_path = UPLOAD_DIR / f"{image_id}{ext}"
-        with open(save_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
+        contents = await file.read()
+
+        if ext in (".heic", ".heif"):
+            tmp = UPLOAD_DIR / f"{image_id}{ext}"
+            tmp.write_bytes(contents)
+            try:
+                img = ImageOps.exif_transpose(Image.open(tmp))
+                save_path = UPLOAD_DIR / f"{image_id}.jpg"
+                img.save(str(save_path), "JPEG", quality=98)
+                tmp.unlink()
+                log.info("Batch: converted HEIC → JPEG: %s", save_path.name)
+            except Exception as e:
+                log.error("Batch HEIC conversion failed: %s", e)
+                continue
+        elif ext in RAW_EXTS:
+            save_path = _demosaic_raw(image_id, contents, ext)
+            if save_path is None:
+                continue
+        elif ext in (".jpg", ".jpeg"):
+            # Bake EXIF orientation into pixels so pipeline ≡ browser rotation.
+            try:
+                import io
+                img = ImageOps.exif_transpose(Image.open(io.BytesIO(contents)))
+                save_path = UPLOAD_DIR / f"{image_id}.jpg"
+                img.save(str(save_path), "JPEG", quality=98)
+            except Exception as e:
+                log.error("Batch JPEG normalize failed: %s", e)
+                save_path = UPLOAD_DIR / f"{image_id}{ext}"
+                save_path.write_bytes(contents)
+        else:
+            save_path = UPLOAD_DIR / f"{image_id}{ext}"
+            save_path.write_bytes(contents)
+
         image_paths.append(str(save_path))
 
     return {"batch_id": batch_id, "count": len(image_paths), "paths": image_paths}
@@ -72,6 +119,7 @@ async def batch_process(
     stock: str = Query("portra400"),
     include_border: bool = Query(True),
 ):
+    _cleanup_old_batch_jobs()
     batch_id = str(uuid.uuid4())[:8]
     _batch_jobs[batch_id] = {
         "status": "processing",
@@ -79,6 +127,7 @@ async def batch_process(
         "current": 0,
         "total": len(paths),
         "current_file": "",
+        "created_at": time.time(),
     }
 
     t = threading.Thread(target=_run_batch, args=(batch_id, paths, stock, include_border))
@@ -101,11 +150,12 @@ async def batch_download(batch_id: str):
     if not out_dir.exists():
         return JSONResponse(status_code=404, content={"error": "No output"})
 
-    # Create zip
+    # Create zip — include JPEG, TIFF, and bordered outputs
     zip_path = OUTPUT_DIR / f"{batch_id}.zip"
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for f in out_dir.glob("*.jpg"):
-            zf.write(f, f.name)
+        for f in out_dir.iterdir():
+            if f.suffix.lower() in (".jpg", ".tiff"):
+                zf.write(f, f.name)
 
     return FileResponse(str(zip_path), media_type="application/zip",
                         filename=f"film_batch_{batch_id}.zip")

@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+opencv-python
+numpy
+scipy
+spectral_film_lut
+Pillow
+pillow-heif
+rawpy
+colour-science

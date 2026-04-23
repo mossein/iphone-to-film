@@ -1,8 +1,10 @@
 """Gallery route — tiny thumbnails of every stock for quick comparison."""
 
 import io
+import re
 import hashlib
 import asyncio
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from fastapi import APIRouter, Query
@@ -20,16 +22,26 @@ router = APIRouter()
 
 UPLOAD_DIR = Path(__file__).parent.parent / "uploads"
 
-# Cache: (image_id, stock_key, print_key) -> jpeg bytes
-_thumb_cache = {}
+_UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+
+# Bounded cache: (image_id, stock_key, print_key) -> jpeg bytes
+_THUMB_CACHE_MAX = 500
+_thumb_cache = OrderedDict()
+
+
+def _thumb_cache_put(key, value):
+    _thumb_cache[key] = value
+    while len(_thumb_cache) > _THUMB_CACHE_MAX:
+        _thumb_cache.popitem(last=False)
+
 
 # Thread pool for thumbnail generation — doesn't block the main event loop
-_thumb_pool = ThreadPoolExecutor(max_workers=2)
+_thumb_pool = ThreadPoolExecutor(max_workers=4)
 
 
 def _process_thumbnail(img, stock):
     """Minimal pipeline for fast thumbnails — just the essentials."""
-    img = apply_film_acutance(img, 0.20)
+    img = apply_film_acutance(img, 0.35)
     img = apply_film_conversion(img, stock)
     img = apply_highlight_rolloff(img, shoulder=0.82, strength=0.6)
     img = apply_halation(img, stock)
@@ -39,18 +51,21 @@ def _process_thumbnail(img, stock):
 
 
 def _find_and_load(image_id, max_dim=400):
-    """Find uploaded image and resize for thumbnail."""
+    """Find uploaded image and return float32 BGR [0,1] for the pipeline."""
+    from core.pipeline import _load_as_float
     for ext in (".jpg", ".jpeg", ".png", ".heic", ".tiff", ".tif"):
         p = UPLOAD_DIR / f"{image_id}{ext}"
         if p.exists():
-            img = cv2.imread(str(p), cv2.IMREAD_COLOR)
-            if img is not None:
-                h, w = img.shape[:2]
-                if max(h, w) > max_dim:
-                    scale = max_dim / max(h, w)
-                    img = cv2.resize(img, (int(w * scale), int(h * scale)),
-                                     interpolation=cv2.INTER_AREA)
-                return img
+            try:
+                img = _load_as_float(p)
+            except Exception:
+                continue
+            h, w = img.shape[:2]
+            if max(h, w) > max_dim:
+                scale = max_dim / max(h, w)
+                img = cv2.resize(img, (int(w * scale), int(h * scale)),
+                                 interpolation=cv2.INTER_AREA)
+            return img
     return None
 
 
@@ -58,6 +73,7 @@ def _generate_thumb(image_id, stock_key, print_stock_key):
     """Synchronous thumbnail generation — runs in thread pool."""
     cache_key = (image_id, stock_key, print_stock_key or "default")
     if cache_key in _thumb_cache:
+        _thumb_cache.move_to_end(cache_key)
         return _thumb_cache[cache_key]
 
     img = _find_and_load(image_id)
@@ -75,9 +91,11 @@ def _generate_thumb(image_id, stock_key, print_stock_key):
 
     result = _process_thumbnail(img, built)
 
-    _, buf = cv2.imencode(".jpg", result, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    # Pipeline emits float32 [0,1]; quantize for JPEG encode.
+    result_u8 = (np.clip(result, 0, 1) * 255.0 + 0.5).astype(np.uint8)
+    _, buf = cv2.imencode(".jpg", result_u8, [cv2.IMWRITE_JPEG_QUALITY, 70])
     jpeg_bytes = buf.tobytes()
-    _thumb_cache[cache_key] = jpeg_bytes
+    _thumb_cache_put(cache_key, jpeg_bytes)
     return jpeg_bytes
 
 
@@ -87,6 +105,9 @@ async def thumbnail(
     stock: str = Query("portra400"),
     print_stock: str = Query(None),
 ):
+    if not _UUID_RE.match(image_id):
+        return JSONResponse(status_code=400, content={"error": "Invalid image ID"})
+
     cache_key = (image_id, stock, print_stock or "default")
     if cache_key in _thumb_cache:
         return Response(content=_thumb_cache[cache_key], media_type="image/jpeg")
