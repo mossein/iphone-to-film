@@ -20,7 +20,7 @@ from core.pipeline import (apply_film_acutance, apply_film_conversion,
 
 router = APIRouter()
 
-UPLOAD_DIR = Path(__file__).parent.parent / "uploads"
+from web._paths import UPLOAD_DIR  # bundle-aware writable dir
 
 _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 

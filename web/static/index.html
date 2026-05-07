@@ -101,6 +101,73 @@
                     </div>
                 </div>
             </section>
+            <section>
+                <div class="section-head section-head-toggle" data-toggle="look-grid">
+                    Look <span class="dim">(advanced)</span><span class="toggle-arrow">▾</span>
+                </div>
+                <div class="params-grid params-collapsed" id="look-grid">
+                    <div class="prm" data-param="halation_strength">
+                        <div class="prm-head"><span>Halation</span><span class="prm-val">—</span></div>
+                        <input type="range" min="0" max="0.6" step="0.01" value="-1" data-decimals="2" data-skip-if="-1">
+                    </div>
+                    <div class="prm" data-param="halation_radius">
+                        <div class="prm-head"><span>Halation Radius</span><span class="prm-val">—</span></div>
+                        <input type="range" min="0.01" max="0.15" step="0.005" value="-1" data-decimals="3" data-skip-if="-1">
+                    </div>
+                    <div class="prm" data-param="bloom">
+                        <div class="prm-head"><span>Bloom</span><span class="prm-val">—</span></div>
+                        <input type="range" min="0" max="0.3" step="0.01" value="-1" data-decimals="2" data-skip-if="-1">
+                    </div>
+                    <div class="prm" data-param="vignette">
+                        <div class="prm-head"><span>Vignette</span><span class="prm-val">—</span></div>
+                        <input type="range" min="0" max="0.6" step="0.01" value="-1" data-decimals="2" data-skip-if="-1">
+                    </div>
+                    <div class="prm" data-param="acutance">
+                        <div class="prm-head"><span>Softness</span><span class="prm-val">0.35</span></div>
+                        <input type="range" min="0" max="0.7" step="0.01" value="0.35" data-decimals="2">
+                    </div>
+                    <div class="prm" data-param="grain_amount">
+                        <div class="prm-head"><span>Grain</span><span class="prm-val">1.00</span></div>
+                        <input type="range" min="0" max="2.5" step="0.05" value="1.0" data-decimals="2">
+                    </div>
+                    <div class="prm" data-param="scanner_warmth">
+                        <div class="prm-head"><span>Scanner Warmth</span><span class="prm-val">0.012</span></div>
+                        <input type="range" min="-0.05" max="0.05" step="0.002" value="0.012" data-decimals="3">
+                    </div>
+                    <div class="prm" data-param="light_leak">
+                        <div class="prm-head"><span>Light Leak</span><span class="prm-val">0.00</span></div>
+                        <input type="range" min="0" max="0.3" step="0.01" value="0" data-decimals="2">
+                    </div>
+                    <div class="prm" data-param="chromatic_aberration">
+                        <div class="prm-head"><span>Chromatic Ab.</span><span class="prm-val">0.000</span></div>
+                        <input type="range" min="0" max="0.005" step="0.0002" value="0" data-decimals="4">
+                    </div>
+                    <div class="prm" data-param="auto_exposure">
+                        <div class="prm-head"><span>Auto-Exposure</span><span class="prm-val">0.00</span></div>
+                        <input type="range" min="0" max="1" step="0.05" value="0" data-decimals="2">
+                    </div>
+                    <div class="prm" data-param="artifact_density">
+                        <div class="prm-head"><span>Scratches & Hair</span><span class="prm-val">0.00</span></div>
+                        <input type="range" min="0" max="2" step="0.05" value="0" data-decimals="2">
+                    </div>
+                    <div class="prm" data-param="rolloff_strength">
+                        <div class="prm-head"><span>Highlight Compress</span><span class="prm-val">0.60</span></div>
+                        <input type="range" min="0" max="1" step="0.02" value="0.6" data-decimals="2">
+                    </div>
+                    <div class="prm" data-param="misregistration">
+                        <div class="prm-head"><span>RGB Misregistration</span><span class="prm-val">0.50</span></div>
+                        <input type="range" min="0" max="2" step="0.05" value="0.5" data-decimals="2">
+                    </div>
+                    <div class="prm" data-param="breath">
+                        <div class="prm-head"><span>Film Breath</span><span class="prm-val">0.012</span></div>
+                        <input type="range" min="0" max="0.05" step="0.002" value="0.012" data-decimals="3">
+                    </div>
+                    <div class="prm" data-param="dust_amount">
+                        <div class="prm-head"><span>Dust Amount</span><span class="prm-val">10</span></div>
+                        <input type="range" min="0" max="60" step="1" value="10" data-decimals="0">
+                    </div>
+                </div>
+            </section>
         </aside>
 
         <!-- Compare canvas -->
@@ -146,6 +213,21 @@
     </div>
     <div class="gallery-grid" id="gallery-grid"></div>
 </div>
+
+<!-- ═══ FLOATING BATCH PROGRESS (used by gallery "Apply to batch" buttons) ═══ -->
+<div id="gal-batch-popup" class="gal-batch-popup" style="display:none">
+    <div class="gbp-head">
+        <span class="gbp-title">Batch</span>
+        <button class="gbp-close" id="gbp-close" aria-label="Close">&times;</button>
+    </div>
+    <div class="gbp-body">
+        <div class="gbp-recipe" id="gbp-recipe">—</div>
+        <div class="gbp-step" id="gbp-step">Uploading…</div>
+        <div class="gbp-bar"><div class="gbp-fill" id="gbp-fill"></div></div>
+        <a id="gbp-dl" class="gbp-dl" href="#" style="display:none" download>Download .zip</a>
+    </div>
+</div>
+<input type="file" id="gal-batch-input" accept="image/*,.cr3,.cr2,.nef,.arw,.dng,.raf,.rw2,.orf" multiple hidden>
 
 <!-- ═══ BATCH VIEW ═══ -->
 <div id="view-batch" class="view" style="display:none">

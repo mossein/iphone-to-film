@@ -18,8 +18,7 @@ log = logging.getLogger(__name__)
 
 router = APIRouter()
 
-UPLOAD_DIR = Path(__file__).parent.parent / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
+from web._paths import UPLOAD_DIR  # bundle-aware writable dir
 
 _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 
@@ -77,8 +76,11 @@ def _demosaic_raw(image_id: str, contents: bytes, ext: str) -> Path | None:
 
         # Exposure floor: no_auto_bright leaves linear data; stretch so the 99th
         # percentile lands around 0.9. Keeps highlights + prevents image from
-        # being uselessly dark when the scene didn't expose to the right.
-        p99 = float(np.percentile(lin_srgb, 99))
+        # being uselessly dark when the scene didn't expose to the right. Compute
+        # the percentile on positive pixels only — ProPhoto→sRGB can leave some
+        # negatives for out-of-gamut colors that would otherwise skew the stat.
+        pos = lin_srgb[lin_srgb > 0]
+        p99 = float(np.percentile(pos, 99)) if pos.size else 0.0
         if p99 > 1e-4:
             lin_srgb = lin_srgb * min(0.9 / p99, 4.0)
 

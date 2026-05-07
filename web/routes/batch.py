@@ -13,7 +13,8 @@ import io
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 
-from core.stocks import get_stock
+from core.stocks import get_stock, build_custom_stock
+from core.conversion import PRINT_STOCKS
 from core.pipeline import process
 
 register_heif_opener()
@@ -21,8 +22,7 @@ log = logging.getLogger(__name__)
 
 router = APIRouter()
 
-UPLOAD_DIR = Path(__file__).parent.parent / "uploads"
-OUTPUT_DIR = Path(__file__).parent.parent / "output"
+from web._paths import UPLOAD_DIR, OUTPUT_DIR  # bundle-aware writable dirs
 
 # Batch job tracking
 _batch_jobs = {}
@@ -37,8 +37,7 @@ def _cleanup_old_batch_jobs():
         del _batch_jobs[k]
 
 
-def _run_batch(batch_id, image_paths, stock_key, include_border):
-    built = get_stock(stock_key)
+def _run_batch(batch_id, image_paths, built, include_border):
     total = len(image_paths)
     results = []
 
@@ -117,8 +116,73 @@ async def batch_upload(files: list[UploadFile] = File(...)):
 async def batch_process(
     paths: list[str] = Query(...),
     stock: str = Query("portra400"),
+    print_stock: str = Query(None),
+    exp_comp: float = Query(None),
+    sat: float = Query(None),
+    pre_flash_neg: float = Query(-4),
+    black_offset: float = Query(0),
+    white_point: float = Query(1.0),
+    tint: float = Query(0),
+    halation_strength: float = Query(None),
+    halation_radius: float = Query(None),
+    halation_threshold: float = Query(None),
+    bloom: float = Query(None),
+    vignette: float = Query(None),
+    acutance: float = Query(None),
+    grain_amount: float = Query(None),
+    rolloff_knee: float = Query(None),
+    rolloff_strength: float = Query(None),
+    breath: float = Query(None),
+    misregistration: float = Query(None),
+    dust_amount: int = Query(None),
+    scanner_warmth: float = Query(None),
+    scanner_lift: float = Query(None),
+    light_leak: float = Query(None),
+    chromatic_aberration: float = Query(None),
+    auto_exposure: float = Query(None),
+    artifact_density: float = Query(None),
     include_border: bool = Query(True),
 ):
+    pipeline = {k: v for k, v in {
+        "halation_strength": halation_strength,
+        "halation_radius": halation_radius,
+        "halation_threshold": halation_threshold,
+        "bloom": bloom,
+        "vignette": vignette,
+        "acutance": acutance,
+        "grain_amount": grain_amount,
+        "rolloff_knee": rolloff_knee,
+        "rolloff_strength": rolloff_strength,
+        "breath": breath,
+        "misregistration": misregistration,
+        "dust_amount": dust_amount,
+        "scanner_warmth": scanner_warmth,
+        "scanner_lift": scanner_lift,
+        "light_leak": light_leak,
+        "chromatic_aberration": chromatic_aberration,
+        "auto_exposure": auto_exposure,
+        "artifact_density": artifact_density,
+    }.items() if v is not None}
+
+    # Build the stock once and reuse for every image — same recipe applied
+    # uniformly. has_custom mirrors the logic in /api/process so a plain
+    # batch (no overrides) goes through get_stock for cache hits.
+    has_custom = (print_stock is not None or exp_comp is not None or
+                  sat is not None or pre_flash_neg != -4 or
+                  black_offset != 0 or white_point != 1.0 or tint != 0
+                  or bool(pipeline))
+    if has_custom:
+        print_data = PRINT_STOCKS[print_stock]["data"] if print_stock else None
+        built = build_custom_stock(
+            stock, print_stock_data=print_data,
+            exp_comp=exp_comp, sat=sat,
+            pre_flash_neg=pre_flash_neg, black_offset=black_offset,
+            white_point=white_point, tint=tint,
+            overrides=pipeline,
+        )
+    else:
+        built = get_stock(stock)
+
     _cleanup_old_batch_jobs()
     batch_id = str(uuid.uuid4())[:8]
     _batch_jobs[batch_id] = {
@@ -130,7 +194,7 @@ async def batch_process(
         "created_at": time.time(),
     }
 
-    t = threading.Thread(target=_run_batch, args=(batch_id, paths, stock, include_border))
+    t = threading.Thread(target=_run_batch, args=(batch_id, paths, built, include_border))
     t.daemon = True
     t.start()
 

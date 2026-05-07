@@ -809,6 +809,15 @@ def _build_stock(key):
         "bloom": defn["bloom"],
         "border_text": defn["border_text"],
         "film_format_mm": defn["film_format_mm"],
+        # Optional per-stock overrides — pipeline reads these via .get() with
+        # global fallbacks. Pass through whatever the defn provides; absent
+        # keys stay absent.
+        **{k: defn[k] for k in (
+            "acutance", "rolloff_knee", "rolloff_strength", "breath",
+            "misregistration", "dust_amount", "scanner_warmth", "scanner_lift",
+            "light_leak", "grade", "chromatic_aberration", "auto_exposure",
+            "base_color", "base_color_strength", "artifact_density",
+        ) if k in defn},
         "neg_data": defn["neg_data"],
         "print_data": defn["print_data"],
         "exposure_kelvin": defn["exposure_kelvin"],
@@ -819,10 +828,23 @@ def _build_stock(key):
     return stock
 
 
+_PIPELINE_OVERRIDE_KEYS = (
+    "halation_strength", "halation_radius", "halation_threshold",
+    "bloom", "vignette", "acutance", "grain_amount", "rolloff_knee",
+    "rolloff_strength", "breath", "misregistration", "dust_amount",
+    "scanner_warmth", "scanner_lift", "light_leak",
+    "chromatic_aberration", "auto_exposure", "artifact_density",
+    "base_color_strength",
+)
+
+
 def build_custom_stock(key, print_stock_data=None, exp_comp=None, sat=None,
                        pre_flash_neg=-4, pre_flash_print=-4,
-                       black_offset=0, white_point=1.0, tint=0):
-    """Build a stock with custom print pairing or quality parameters."""
+                       black_offset=0, white_point=1.0, tint=0,
+                       overrides=None):
+    """Build a stock with custom print pairing, photochemical params, and/or
+    pipeline-stage overrides. `overrides` is a dict; only keys in
+    _PIPELINE_OVERRIDE_KEYS with non-None values take effect."""
     defn = _STOCK_DEFS[key]
     pdata = print_stock_data if print_stock_data is not None else defn["print_data"]
     ec = exp_comp if exp_comp is not None else defn["exp_comp"]
@@ -849,7 +871,20 @@ def build_custom_stock(key, print_stock_data=None, exp_comp=None, sat=None,
         "bloom": defn["bloom"],
         "border_text": defn["border_text"],
         "film_format_mm": defn["film_format_mm"],
+        # Optional per-stock overrides — pipeline reads these via .get() with
+        # global fallbacks. Pass through whatever the defn provides; absent
+        # keys stay absent.
+        **{k: defn[k] for k in (
+            "acutance", "rolloff_knee", "rolloff_strength", "breath",
+            "misregistration", "dust_amount", "scanner_warmth", "scanner_lift",
+            "light_leak", "grade", "chromatic_aberration", "auto_exposure",
+            "base_color", "base_color_strength", "artifact_density",
+        ) if k in defn},
     }
+    if overrides:
+        for k, v in overrides.items():
+            if k in _PIPELINE_OVERRIDE_KEYS and v is not None:
+                stock[k] = v
     return stock
 
 
@@ -870,6 +905,40 @@ def get_all_stocks():
         }
         for key, defn in _STOCK_DEFS.items()
     }
+
+
+_DEFAULT_PIPELINE_VALUES = {
+    "halation_strength": 0.0,
+    "halation_radius": 0.05,
+    "halation_threshold": 0.65,
+    "bloom": 0.08,
+    "vignette": 0.25,
+    "acutance": 0.35,
+    "grain_amount": 1.0,
+    "rolloff_knee": 0.82,
+    "rolloff_strength": 0.6,
+    "breath": 0.012,
+    "misregistration": 0.5,
+    "dust_amount": 10,
+    "scanner_warmth": 0.012,
+    "scanner_lift": 3.0 / 255.0,
+    "light_leak": 0.0,
+    "chromatic_aberration": 0.0,
+    "auto_exposure": 0.0,
+    "artifact_density": 0.0,
+}
+
+
+def get_stock_defaults(key):
+    """Return the per-stock default values for every UI-exposed pipeline param.
+    Falls back to the global default when the stock doesn't author the field —
+    so the UI always has a baseline to render the slider against."""
+    defn = _STOCK_DEFS[key]
+    out = dict(_DEFAULT_PIPELINE_VALUES)
+    for k in out:
+        if k in defn:
+            out[k] = defn[k]
+    return out
 
 
 def get_stocks_by_category():

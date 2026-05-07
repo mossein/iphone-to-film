@@ -6,7 +6,8 @@ manufacturer datasheets. Not a LUT. Not a filter. Actual film science.
 """
 
 import warnings
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=".*colour-science.*")
 
 import sys
 from pathlib import Path

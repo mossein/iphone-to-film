@@ -1,5 +1,7 @@
 """Process route — full-resolution export with progress tracking."""
 
+import re
+import time
 import uuid
 import threading
 from pathlib import Path
@@ -12,12 +14,21 @@ from core.pipeline import process
 
 router = APIRouter()
 
-UPLOAD_DIR = Path(__file__).parent.parent / "uploads"
-OUTPUT_DIR = Path(__file__).parent.parent / "output"
-OUTPUT_DIR.mkdir(exist_ok=True)
+from web._paths import UPLOAD_DIR, OUTPUT_DIR  # bundle-aware writable dirs
 
-# Job tracking: job_id -> {status, progress, step, result_clean, result_bordered}
+_UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+
+# Job tracking: job_id -> {status, progress, step, result_clean, result_bordered, created_at}
 _jobs = {}
+_JOB_TTL = 3600  # 1 hour
+
+
+def _cleanup_old_jobs():
+    now = time.time()
+    expired = [k for k, v in _jobs.items()
+               if v.get("status") in ("done", "error") and now - v.get("created_at", now) > _JOB_TTL]
+    for k in expired:
+        del _jobs[k]
 
 
 def _run_job(job_id, img_path, built, include_border):
@@ -60,8 +71,29 @@ async def start_process(
     black_offset: float = Query(0),
     white_point: float = Query(1.0),
     tint: float = Query(0),
+    halation_strength: float = Query(None),
+    halation_radius: float = Query(None),
+    halation_threshold: float = Query(None),
+    bloom: float = Query(None),
+    vignette: float = Query(None),
+    acutance: float = Query(None),
+    grain_amount: float = Query(None),
+    rolloff_knee: float = Query(None),
+    rolloff_strength: float = Query(None),
+    breath: float = Query(None),
+    misregistration: float = Query(None),
+    dust_amount: int = Query(None),
+    scanner_warmth: float = Query(None),
+    scanner_lift: float = Query(None),
+    light_leak: float = Query(None),
+    chromatic_aberration: float = Query(None),
+    auto_exposure: float = Query(None),
+    artifact_density: float = Query(None),
     include_border: bool = Query(True),
 ):
+    if not _UUID_RE.match(image_id):
+        return JSONResponse(status_code=400, content={"error": "Invalid image ID"})
+
     # Find the uploaded image
     img_path = None
     for ext in (".jpg", ".jpeg", ".png", ".heic", ".tiff", ".tif"):
@@ -72,10 +104,32 @@ async def start_process(
     if not img_path:
         return JSONResponse(status_code=404, content={"error": "Image not found"})
 
+    pipeline = {k: v for k, v in {
+        "halation_strength": halation_strength,
+        "halation_radius": halation_radius,
+        "halation_threshold": halation_threshold,
+        "bloom": bloom,
+        "vignette": vignette,
+        "acutance": acutance,
+        "grain_amount": grain_amount,
+        "rolloff_knee": rolloff_knee,
+        "rolloff_strength": rolloff_strength,
+        "breath": breath,
+        "misregistration": misregistration,
+        "dust_amount": dust_amount,
+        "scanner_warmth": scanner_warmth,
+        "scanner_lift": scanner_lift,
+        "light_leak": light_leak,
+        "chromatic_aberration": chromatic_aberration,
+        "auto_exposure": auto_exposure,
+        "artifact_density": artifact_density,
+    }.items() if v is not None}
+
     # Build stock
     has_custom = (print_stock is not None or exp_comp is not None or
                   sat is not None or pre_flash_neg != -4 or
-                  black_offset != 0 or white_point != 1.0 or tint != 0)
+                  black_offset != 0 or white_point != 1.0 or tint != 0
+                  or bool(pipeline))
 
     if has_custom:
         print_data = PRINT_STOCKS[print_stock]["data"] if print_stock else None
@@ -84,13 +138,15 @@ async def start_process(
             exp_comp=exp_comp, sat=sat,
             pre_flash_neg=pre_flash_neg, black_offset=black_offset,
             white_point=white_point, tint=tint,
+            overrides=pipeline,
         )
     else:
         built = get_stock(stock)
 
-    # Create job
+    # Create job (and clean up old ones)
+    _cleanup_old_jobs()
     job_id = str(uuid.uuid4())[:8]
-    _jobs[job_id] = {"status": "processing", "progress": 0, "step": "Starting"}
+    _jobs[job_id] = {"status": "processing", "progress": 0, "step": "Starting", "created_at": time.time()}
 
     # Run in background thread
     t = threading.Thread(target=_run_job, args=(job_id, img_path, built, include_border))
@@ -127,8 +183,9 @@ async def download(job_id: str, variant: str = Query("clean")):
     if not file_path or not Path(file_path).exists():
         return JSONResponse(status_code=404, content={"error": f"No {variant} output"})
 
+    media = "image/tiff" if variant == "tiff" else "image/jpeg"
     return FileResponse(
         file_path,
-        media_type="image/jpeg",
+        media_type=media,
         filename=Path(file_path).name,
     )

@@ -3,3 +3,13 @@ __pycache__/
 originals/
 film_output*/
 *.zip
+.DS_Store
+web/uploads/
+web/output/
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+# PyInstaller build artifacts
+build/
+dist/

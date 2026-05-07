@@ -200,6 +200,26 @@ If your photos are HEIC (iPhone default), convert first:
 sips -s format jpeg -s formatOptions 100 input.heic --out output.jpeg
 ```
 
+### Web app
+
+```bash
+python3 -m web.app   # http://localhost:8000
+```
+
+Drag in JPEG / PNG / HEIC / TIFF / RAW (`.cr3`, `.nef`, `.arw`, `.dng`, etc.). Pick a stock, tweak the photochemical and Look sliders, export full-res JPEG + 16-bit TIFF.
+
+### Desktop app (macOS)
+
+A native `.app` bundle is available — same UI, no browser needed.
+
+```bash
+pip install --break-system-packages pywebview pyinstaller
+pyinstaller film.spec --noconfirm
+open dist/Film.app
+```
+
+Build details and the rest of the architecture notes live in [CLAUDE.md](CLAUDE.md).
+
 ## What still can't be faked
 
 Even with physically accurate color science, some things are fundamentally baked into the digital capture:

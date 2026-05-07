@@ -4,12 +4,43 @@ Film processing pipeline — all effect functions and the main process() entry p
 Convention: every stage takes a float32 BGR image in [0,1] and returns the same.
 The loader normalizes uint8/uint16/float inputs once; the final save step quantizes
 back to uint8 (JPEG) and uint16 (TIFF). Intermediate stages never touch 0-255.
+
+Color-space convention:
+  • Input to the pipeline is sRGB-encoded (gamma-companded). The spectral
+    conversion expects and returns sRGB-encoded.
+  • Optical effects (halation, bloom, vignette, grain, breath, scanner warmth)
+    model light scattering and detector behavior — they are physically defined
+    in *linear* light and run in a linear sRGB stage between the spectral LUT
+    and final sRGB encoding.
+  • Tonal/perceptual effects (acutance, highlight rolloff, dust, border) stay
+    in sRGB-encoded space.
 """
 
 import cv2
 import math
 import numpy as np
 from pathlib import Path
+
+
+# ─── sRGB ⇄ LINEAR ───────────────────────────────────────────────────────────
+# Piecewise sRGB EOTF/OETF (IEC 61966-2-1). Stays correct near zero where
+# the pure-2.2 power approximation has the wrong slope.
+
+def _to_linear(img):
+    a = 0.055
+    return np.where(
+        img <= 0.04045,
+        img / 12.92,
+        np.power(np.clip((img + a) / (1.0 + a), 1e-10, None), 2.4),
+    ).astype(np.float32)
+
+def _to_srgb(img):
+    a = 0.055
+    return np.where(
+        img <= 0.0031308,
+        12.92 * img,
+        (1.0 + a) * np.power(np.clip(img, 1e-10, None), 1.0 / 2.4) - a,
+    ).astype(np.float32)
 
 
 # ─── NPS GRAIN KERNEL (from Stephenson & Saunders paper) ─────────────────────
@@ -44,7 +75,12 @@ def _grain_kernel(pixel_size_mm, grain_size_mm=0.006, grain_sigma=0.3):
 
     kernel = np.fft.ifft2(np.sqrt(nps))
     kernel = np.fft.fftshift(kernel.real)
-    kernel /= np.sqrt(np.sum(kernel))
+    # L2-normalize so convolution preserves unit noise variance regardless of
+    # kernel size. The previous sqrt(sum(kernel)) normalization let variance
+    # explode at full-res (large kernel) — B&W exports came out as binary noise.
+    norm = np.sqrt(np.sum(kernel ** 2))
+    if norm > 0:
+        kernel /= norm
     return kernel
 
 def _generate_grain(h, w, channels, ppmm, grain_size_mm=0.006, grain_sigma=0.3):
@@ -69,19 +105,49 @@ def apply_volumetric_grain(img, stock):
     frame_width_mm = 36 if film_mm == 35 else 56
     ppmm = max(w, h) / frame_width_mm
 
+    grain_amount = float(stock.get("grain_amount", 1.0))
+    if grain_amount <= 0:
+        return img
+
     fimg = img.copy()
     is_bw = stock.get("category") == "bw"
 
-    rms = getattr(neg, 'rms', 4.0)
-    grain_size_mm = 0.008 + rms * 0.002
+    rms_attr = getattr(neg, 'rms', None)
+    rms = float(rms_attr) if (rms_attr is not None and np.isfinite(rms_attr)) else 4.0
 
-    # B&W film has one emulsion layer, not three — all channels share the same
-    # grain texture. Independent per-channel grain on a B&W image produces
-    # magenta/green chromatic speckle.
-    n_channels = 1 if is_bw else 3
-    grain_texture = _generate_grain(h, w, n_channels, ppmm,
-                                     grain_size_mm=grain_size_mm,
-                                     grain_sigma=0.3)
+    # B&W manufacturer RMS values (Tri-X ≈ 17, Double-X ≈ 14) are reported on a
+    # different scale than the per-layer dye-cloud RMS used by color stocks
+    # (≈ 3–5). Using the same coefficients yields huge, chunky grain on B&W.
+    if is_bw:
+        grain_size_mm = 0.008 + rms * 0.0008   # ~0.022mm for Tri-X (vs 0.042 with color formula)
+        grain_mag_coef = 0.0022                # ~0.037 std on midtones (vs 0.136)
+    else:
+        grain_size_mm = 0.008 + rms * 0.002
+        grain_mag_coef = 0.008
+
+    if is_bw:
+        # B&W: single emulsion → one shared grain channel.
+        grain_texture = _generate_grain(h, w, 1, ppmm,
+                                         grain_size_mm=grain_size_mm,
+                                         grain_sigma=0.3)
+        gray = cv2.cvtColor(fimg, cv2.COLOR_BGR2GRAY)
+        lum_resp = np.clip(np.sqrt(4.0 * gray * (1.0 - gray)), 0.0, 1.0)
+        gmag = (lum_resp * rms * grain_mag_coef * grain_amount).astype(np.float32)[..., None]
+        delta = grain_texture[:, :, 0:1] * gmag
+        fimg += delta
+        return np.clip(fimg, 0, 1)
+
+    # ── Color path ─────────────────────────────────────────────────────────
+    # Generate luminance grain and chroma grain *separately* so we can gate
+    # them differently. Real color film grain is dominantly luminance; chroma
+    # speckle should fade out in shadows (no dye activation in deep blacks)
+    # AND in highlights (saturated dye), leaving only luma grain there.
+    luma_tex = _generate_grain(h, w, 1, ppmm,
+                                grain_size_mm=grain_size_mm,
+                                grain_sigma=0.3)
+    chroma_tex = _generate_grain(h, w, 3, ppmm,
+                                  grain_size_mm=grain_size_mm * 1.4,
+                                  grain_sigma=0.3)
 
     pixels = fimg.reshape(-1, 3).astype(np.float64)
     try:
@@ -94,21 +160,31 @@ def apply_volumetric_grain(img, stock):
         else:
             raise ValueError(f"Unexpected grain_factors shape: {gf.shape}")
     except Exception:
-        gray = cv2.cvtColor(fimg, cv2.COLOR_BGR2GRAY)
-        lum_resp = np.clip(np.sqrt(4.0 * gray * (1.0 - gray)), 0.25, 1.0)
+        gray_fb = cv2.cvtColor(fimg, cv2.COLOR_BGR2GRAY)
+        lum_resp = np.clip(np.sqrt(4.0 * gray_fb * (1.0 - gray_fb)), 0.0, 1.0)
         grain_factors = np.stack([lum_resp * rms * 0.008] * 3, axis=-1).astype(np.float32)
 
-    if is_bw:
-        # Single mono grain, averaged per-pixel intensity so R=G=B stays R=G=B.
-        gt = grain_texture[:, :, 0]
-        gmag = grain_factors.mean(axis=-1)
-        delta = gt * gmag
-        for c in range(3):
-            fimg[:, :, c] += delta
-    else:
-        fimg[:, :, 2] += grain_texture[:, :, 0] * grain_factors[:, :, 0]  # R
-        fimg[:, :, 1] += grain_texture[:, :, 1] * grain_factors[:, :, 1]  # G
-        fimg[:, :, 0] += grain_texture[:, :, 2] * grain_factors[:, :, 2]  # B
+    gray = cv2.cvtColor(fimg, cv2.COLOR_BGR2GRAY)
+    # Tonal response: midtone-peaked, *zero* at pure black and pure white.
+    # The previous floor of 0.20 was the source of the chromatic speckle in
+    # deep blacks (sunglasses, fabric) — it forced 20% of midtone grain into
+    # regions that should be silent.
+    tone_resp = np.sqrt(np.clip(4.0 * gray * (1.0 - gray), 0.0, 1.0))[..., None]
+    # Chroma gate: chroma noise only meaningful where there's signal in the
+    # midtones. Off below ~6% gray, full above ~30%, soft transition.
+    chroma_gate = np.clip((gray - 0.06) / 0.24, 0.0, 1.0)[..., None]
+
+    luma_scale   = 0.40 * grain_amount
+    chroma_scale = 0.10 * grain_amount  # was 0.25 — too loud, drove the speckle
+
+    luma_delta = luma_tex * grain_factors * tone_resp * luma_scale
+    chroma_delta = (chroma_tex * grain_factors * tone_resp
+                    * chroma_gate * chroma_scale)
+    delta = luma_delta + chroma_delta
+
+    fimg[:, :, 2] += delta[:, :, 0]  # R
+    fimg[:, :, 1] += delta[:, :, 1]  # G
+    fimg[:, :, 0] += delta[:, :, 2]  # B
 
     return np.clip(fimg, 0, 1)
 
@@ -141,6 +217,43 @@ def apply_gate_weave(img, strength=0.4):
 
 
 # ─── FILM ACUTANCE ───────────────────────────────────────────────────────────
+
+def apply_auto_exposure(img, target=0.50, percentile=60.0, strength=1.0):
+    """Push the image toward a target sRGB midtone by finding the chosen
+    percentile of luminance and rescaling so it lands at `target`. Scene-aware
+    pre-conversion exposure adjustment — what a lab does when printing.
+
+    target=0.50 (sRGB midtone), percentile=60 picks "average bright" as the
+    anchor. strength=0 is a no-op; strength=1 fully applies. Works in sRGB
+    space (matches what the spectral LUT consumes)."""
+    if strength <= 0.0:
+        return img
+    luma = (0.0722 * img[:, :, 0] + 0.7152 * img[:, :, 1]
+            + 0.2126 * img[:, :, 2])
+    p = float(np.percentile(luma, percentile))
+    if p <= 1e-4:
+        return img
+    raw_scale = target / p
+    # Clamp the multiplier so deeply over/underexposed shots don't get nuked.
+    scale = float(np.clip(raw_scale, 0.4, 2.5))
+    scale = 1.0 + (scale - 1.0) * strength
+    return np.clip(img * scale, 0.0, 1.0).astype(np.float32)
+
+
+def apply_chromatic_aberration(img, strength=0.0015):
+    """Cheap radial CA — slightly scale R in, scale B out. strength is the
+    relative scale offset (0.0015 = 0.15%). At zero, no-op."""
+    if strength <= 0:
+        return img
+    h, w = img.shape[:2]
+    cy, cx = h / 2.0, w / 2.0
+    M_r = cv2.getRotationMatrix2D((cx, cy), 0, 1.0 - strength)
+    M_b = cv2.getRotationMatrix2D((cx, cy), 0, 1.0 + strength)
+    out = img.copy()
+    out[:, :, 2] = cv2.warpAffine(img[:, :, 2], M_r, (w, h), borderMode=cv2.BORDER_REFLECT)
+    out[:, :, 0] = cv2.warpAffine(img[:, :, 0], M_b, (w, h), borderMode=cv2.BORDER_REFLECT)
+    return out
+
 
 def apply_film_acutance(img, softness=0.20):
     """Film MTF: soften the digital crispness, kill iPhone computational sharpness.
@@ -233,7 +346,10 @@ def apply_light_leak(img, intensity=0.06):
                        (w, h), interpolation=cv2.INTER_CUBIC)
     leak = (leak * np.clip(noise, 0.2, 1.0)).astype(np.float32)
 
-    leak_color = np.array([0.15, 0.45, 1.0], dtype=np.float32)  # BGR: warm orange
+    # BGR warm orange. Original was [0.15, 0.45, 1.0] which is blue-dominant
+    # despite the misleading comment. Real light-seal leaks are warm because
+    # they pass through the orange film base.
+    leak_color = np.array([0.05, 0.40, 1.00], dtype=np.float32)  # BGR
     for c in range(3):
         fimg[:, :, c] += leak * intensity * leak_color[c]
 
@@ -249,39 +365,71 @@ def apply_film_conversion(img, stock):
                            dtype=np.float32)
     if converted.shape[-1] > 3:
         converted = converted[:, :3]
-    return np.clip(converted.reshape(h, w, 3), 0, 1)
+    out = converted.reshape(h, w, 3)
+    # The spectral LUT produces NaN for some out-of-domain inputs (power(negative,frac)).
+    # In the old uint8-per-stage pipeline those silently cast to 0; in the float pipeline
+    # they'd spread via the next GaussianBlur (halation/bloom/acutance) until most of the
+    # image was NaN. Kill them at the boundary where they're created.
+    out = np.nan_to_num(out, nan=0.0, posinf=1.0, neginf=0.0)
+    return np.clip(out, 0, 1)
 
 def apply_halation(img, stock):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    """Halation = red light passing through the silver-halide layers, hitting
+    the film base, and reflecting back. Mask from the RED channel (red/IR
+    penetrates deepest, which is why halation reads as red even on neutral
+    light sources). Inputs are expected in linear light; the per-stock
+    threshold is authored in sRGB-display convention so we linearize it here.
+    """
     strength, color = stock["halation_strength"], stock["halation_color"]
-    threshold = stock["halation_threshold"]
-    bright = np.clip((gray - threshold) / (1.0 - threshold + 1e-6), 0, 1) ** 1.2
-    radius = int(max(img.shape[:2]) * stock["halation_radius"])
+    threshold_srgb = stock["halation_threshold"]
+    # piecewise sRGB → linear, scalar form
+    threshold = (threshold_srgb / 12.92 if threshold_srgb <= 0.04045
+                 else ((threshold_srgb + 0.055) / 1.055) ** 2.4)
+
+    # Red channel in BGR is index 2.
+    red = img[:, :, 2]
+    bright = np.clip((red - threshold) / (1.0 - threshold + 1e-6), 0, 1)
+
+    # Two-scale point-spread: tighter core + much wider tail. Closer to the
+    # actual scattering profile than a single gaussian or a 0.5/0.5 dual.
+    # Format scaling: halation_radius is authored as a fraction of the 35mm
+    # frame. On larger formats the same physical scattering distance covers a
+    # smaller fraction of the frame, so the radius shrinks.
+    fmt_scale = 35.0 / float(stock.get("film_format_mm", 35))
+    radius = int(max(img.shape[:2]) * stock["halation_radius"] * fmt_scale)
+    if radius < 3: radius = 3
     if radius % 2 == 0: radius += 1
-    radius = min(max(radius, 5), 301)
+    radius = min(radius, 301)
     s1 = cv2.GaussianBlur(bright, (radius, radius), radius / 3)
-    r2 = min(radius * 2 + 1, 601)
+    r2 = min(radius * 3 + 1, 901)
     if r2 % 2 == 0: r2 += 1
     s2 = cv2.GaussianBlur(bright, (r2, r2), r2 / 3)
-    spread = s1 * 0.5 + s2 * 0.5
-    halation = np.zeros_like(img)
-    for c in range(3):
-        halation[:, :, c] = spread * color[c]
-    return np.clip(img + halation * strength, 0, 1)
+    spread = s1 * 0.7 + s2 * 0.3
+
+    halation = np.empty_like(img)
+    halation[:, :, 0] = spread * color[2]  # B
+    halation[:, :, 1] = spread * color[1]  # G
+    halation[:, :, 2] = spread * color[0]  # R
+    return np.clip(img + halation * strength, 0, None)
 
 def apply_bloom(img, strength):
+    """Bloom = lens/film internal scattering of bright sources. Linear-light
+    input expected; threshold is the sRGB value 0.5 linearized (= 0.214)."""
     if strength < 0.01:
         return img
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    bright = np.clip((gray - 0.50) / 0.50, 0, 1)
-    bloom = img.copy()
-    for c in range(3):
-        bloom[:, :, c] *= bright
+    threshold = 0.21404114  # _to_linear(0.5)
+    # Rec.709 linear luma — a perceptual-but-linear estimate of brightness.
+    gray = (0.0722 * img[:, :, 0] + 0.7152 * img[:, :, 1]
+            + 0.2126 * img[:, :, 2])
+    bright = np.clip((gray - threshold) / (1.0 - threshold), 0, 1)
+    bloom = img * bright[..., None]
     r = min(max(img.shape[:2]) // 25, 201)
     if r % 2 == 0: r += 1
     r = max(r, 5)
-    bloom = cv2.GaussianBlur(bloom, (r, r), r / 3)
-    return np.clip(1.0 - (1.0 - img) * (1.0 - bloom * strength), 0, 1)
+    bloom = cv2.GaussianBlur(bloom, (r, r), r / 3).astype(np.float32)
+    # Screen blend in linear: 1 - (1-a)(1-b). Don't clip top — outputs can
+    # exceed 1.0 here; sRGB encode at the end of the linear stage will clip.
+    return np.maximum(1.0 - (1.0 - img) * (1.0 - bloom * strength), 0.0)
 
 def apply_vignette(img, strength):
     h, w = img.shape[:2]
@@ -293,8 +441,9 @@ def apply_vignette(img, strength):
         result[:, :, c] *= vig
     return np.clip(result, 0, 1)
 
-def apply_dust_and_artifacts(img, amount=10):
-    """Works on a float32 [0,1] image. cv2.circle/polylines/putText all accept float."""
+def apply_dust_and_artifacts(img, amount=10, stock=None):
+    """Works on a float32 [0,1] image. Dots (always), plus rare scratches and
+    hairs gated on stock["artifact_density"] (0..1, default 0)."""
     h, w = img.shape[:2]
     result = img.copy()
     for _ in range(amount):
@@ -304,33 +453,90 @@ def apply_dust_and_artifacts(img, amount=10):
         opacity = np.random.uniform(0.2, 0.5)
         color = tuple(float(np.clip(result[y, x, c] + val * opacity, 0, 1)) for c in range(3))
         cv2.circle(result, (x, y), sz, color, -1)
-    if amount > 6:
-        sx = np.random.randint(w // 3, 2 * w // 3)
-        sy = np.random.randint(h // 3, 2 * h // 3)
-        pts = [(sx, sy)]
-        for _ in range(np.random.randint(30, 70)):
-            last = pts[-1]
-            pts.append((last[0] + np.random.randint(-3, 4), last[1] + np.random.randint(1, 5)))
-        scratch = (190/255.0, 185/255.0, 180/255.0)
-        cv2.polylines(result, [np.array(pts, dtype=np.int32)], False, scratch, 1, cv2.LINE_AA)
+
+    artifacts = (stock.get("artifact_density", 0.0) if stock else 0.0)
+    if artifacts > 0:
+        # Vertical scratches: 1–2px wide, full-height occasional, slightly
+        # desaturated near-white (silver scratch on negative reads bright).
+        n_scratches = int(np.random.poisson(artifacts * 1.5))
+        for _ in range(n_scratches):
+            sx = np.random.randint(0, w)
+            length = np.random.randint(h // 3, h)
+            sy = np.random.randint(0, max(1, h - length))
+            thickness = np.random.choice([1, 1, 2])
+            shade = np.random.uniform(0.85, 1.0)
+            tint = np.random.uniform(-0.05, 0.05)
+            color = (float(np.clip(shade + tint, 0, 1)),
+                     float(np.clip(shade, 0, 1)),
+                     float(np.clip(shade - tint, 0, 1)))
+            cv2.line(result, (sx, sy), (sx, sy + length), color, thickness, cv2.LINE_AA)
+
+        # Hairs: thin dark curves. Bezier approximated by a few line segments
+        # between random control points.
+        n_hairs = int(np.random.poisson(artifacts * 0.6))
+        for _ in range(n_hairs):
+            cx, cy = np.random.randint(0, w), np.random.randint(0, h)
+            length = np.random.randint(40, min(w, h) // 2)
+            angle = np.random.uniform(0, 2 * np.pi)
+            curl = np.random.uniform(-0.5, 0.5)
+            pts = []
+            for t in np.linspace(0, 1, 12):
+                a = angle + curl * t
+                px = int(cx + length * t * np.cos(a))
+                py = int(cy + length * t * np.sin(a))
+                pts.append((px, py))
+            shade = np.random.uniform(0.0, 0.15)
+            for i in range(len(pts) - 1):
+                cv2.line(result, pts[i], pts[i + 1], (shade, shade, shade), 1, cv2.LINE_AA)
+
     return result
 
+
+def apply_color_grade(img, grade):
+    """ASC-CDL-style display-referred grade. grade is a dict with optional keys:
+        slope:  per-channel multiplier, [b, g, r] in BGR (default [1,1,1])
+        offset: per-channel additive,   [b, g, r] (default [0,0,0])
+        power:  per-channel gamma,      [b, g, r] (default [1,1,1])
+        sat:    saturation around Rec.709 luma  (default 1.0)
+    Output is sRGB-display-referred float32, clipped [0,1]."""
+    out = img.astype(np.float32)
+    slope  = np.asarray(grade.get("slope",  [1.0, 1.0, 1.0]), dtype=np.float32)
+    offset = np.asarray(grade.get("offset", [0.0, 0.0, 0.0]), dtype=np.float32)
+    power  = np.asarray(grade.get("power",  [1.0, 1.0, 1.0]), dtype=np.float32)
+    sat    = float(grade.get("sat", 1.0))
+    out = out * slope + offset
+    out = np.where(out > 0, np.power(np.clip(out, 1e-10, None), power), out)
+    if sat != 1.0:
+        luma = (0.0722 * out[:, :, 0] + 0.7152 * out[:, :, 1]
+                + 0.2126 * out[:, :, 2])[..., None]
+        out = luma + (out - luma) * sat
+    return np.clip(out, 0, 1).astype(np.float32)
+
 def add_film_border(img, stock):
-    """Float32 [0,1] in, float32 [0,1] out."""
+    """Float32 [0,1] in, float32 [0,1] out. 35mm gets sprocket holes; larger
+    formats get a clean black border (medium-format / instant don't have them
+    on the long edges)."""
     h, w = img.shape[:2]
-    bw, bh = int(w * 0.05), int(h * 0.065)
+    fmt_mm = int(stock.get("film_format_mm", 35))
+    is_35 = fmt_mm == 35
+    bw = int(w * (0.05 if is_35 else 0.04))
+    bh = int(h * (0.065 if is_35 else 0.05))
     tw, th = w + 2 * bw, h + 2 * bh
     strip = np.zeros((th, tw, 3), dtype=np.float32)
     strip[:, :] = (8/255.0, 6/255.0, 5/255.0)
     strip[bh:bh+h, bw:bw+w] = img
-    sw, sh = int(tw * 0.017), int(bh * 0.42)
-    spacing = int(tw * 0.047)
-    n = tw // spacing
-    sx = (tw - n * spacing) // 2
-    for i in range(n):
-        x = sx + i * spacing
-        for sy_pos in [int(bh * 0.28), th - int(bh * 0.28) - sh]:
-            cv2.rectangle(strip, (x+2, sy_pos+2), (x+sw-2, sy_pos+sh-2), (2/255.0, 2/255.0, 2/255.0), -1)
+
+    if is_35:
+        sw, sh = int(tw * 0.017), int(bh * 0.42)
+        spacing = int(tw * 0.047)
+        n = tw // spacing
+        sx = (tw - n * spacing) // 2
+        for i in range(n):
+            x = sx + i * spacing
+            for sy_pos in [int(bh * 0.28), th - int(bh * 0.28) - sh]:
+                cv2.rectangle(strip, (x+2, sy_pos+2), (x+sw-2, sy_pos+sh-2),
+                              (2/255.0, 2/255.0, 2/255.0), -1)
+
     font = cv2.FONT_HERSHEY_SIMPLEX
     fs = tw / 3200.0
     tk = max(1, int(fs * 1.5))
@@ -345,13 +551,47 @@ def add_film_border(img, stock):
 
 # ─── LOADER & OUTPUT QUANTIZATION ────────────────────────────────────────────
 
+_RAW_EXTS = (".cr3", ".cr2", ".nef", ".arw", ".dng", ".raf", ".rw2", ".orf",
+             ".pef", ".srw", ".x3f")
+
+def _load_raw_as_float(path):
+    """RAW dispatch for the CLI/loader path.
+
+    The web upload route does its own (better) ProPhoto-domain demosaic and
+    saves a 16-bit sRGB TIFF, so this function is only hit by film_process.py
+    when given a RAW directly. Output is sRGB-encoded BGR float32 [0,1] —
+    matches what the spectral LUT expects downstream.
+    """
+    import rawpy  # imported lazily so non-RAW paths don't pay the cost
+    with rawpy.imread(str(path)) as raw:
+        rgb = raw.postprocess(
+            use_camera_wb=True,
+            no_auto_bright=True,
+            highlight_mode=rawpy.HighlightMode.ReconstructDefault,
+            output_bps=16,
+            gamma=(2.4, 12.92),  # piecewise sRGB OETF — output is sRGB-encoded
+            output_color=rawpy.ColorSpace.sRGB,
+        )
+    rgb = rgb.astype(np.float32) / 65535.0
+    # Auto-stretch: rawpy with no_auto_bright leaves the image at sensor scale.
+    # Push the 99th percentile to ~0.9 so the image isn't uselessly dark.
+    p99 = float(np.percentile(rgb, 99)) if rgb.size else 0.0
+    if 1e-4 < p99 < 0.9:
+        rgb = np.clip(rgb * (0.9 / p99), 0.0, 1.0)
+    bgr = rgb[:, :, ::-1].copy()
+    return bgr
+
 def _load_as_float(img_path):
     """Read image at its native bit depth and normalize to float32 BGR [0,1].
 
-    Supports uint8 (JPEG/PNG) and uint16 (16-bit TIFF from RAW demosaic).
-    Preserves full 16-bit dynamic range when present — that's the whole point
-    of uploading RAW instead of JPEG.
+    Supports uint8 (JPEG/PNG), uint16 (TIFF from RAW demosaic), and RAW
+    (.cr3/.nef/.arw/.dng etc.) via rawpy. RAW dispatch matters for the CLI;
+    the web upload route already demosaics on intake.
     """
+    img_path = Path(img_path)
+    if img_path.suffix.lower() in _RAW_EXTS:
+        return _load_raw_as_float(img_path)
+
     raw = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
     if raw is None:
         raise ValueError(f"Could not read image: {img_path}")
@@ -418,36 +658,88 @@ def process(img_path, stock, output_dir=None, max_dimension=None,
             scale = max_dimension / max(h, w)
             img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
+    # Per-stock with sensible global fallbacks (Tier 2.1).
+    acutance       = stock.get("acutance", 0.35)
+    rolloff_knee   = stock.get("rolloff_knee", 0.82)
+    rolloff_str    = stock.get("rolloff_strength", 0.6)
+    breath_str     = stock.get("breath", 0.012)
+    misreg_str     = stock.get("misregistration", 0.5)
+    dust_amount    = stock.get("dust_amount", 10)
+    scanner_warmth = stock.get("scanner_warmth", 0.012)
+    scanner_lift   = stock.get("scanner_lift", 3.0 / 255.0)
+    light_leak_int = stock.get("light_leak", 0.0)
+    grade          = stock.get("grade")  # optional CDL dict
+    ca_strength    = stock.get("chromatic_aberration", 0.0)
+    auto_exp_str   = stock.get("auto_exposure", 0.0)  # 0=off; 0.5–1.0 sensible range
+
+    # ── Adaptive exposure (lab-style auto-print). Off by default; per-stock.
+    if auto_exp_str > 0:
+        _progress("Auto-exposure", 3)
+        img = apply_auto_exposure(img, strength=auto_exp_str)
+
+    # ── sRGB pre-conversion: perceptual softening + emulsion-layer registration
     _progress("Film acutance", 5)
-    img = apply_film_acutance(img, 0.35)
+    img = apply_film_acutance(img, acutance)
 
-    _progress("Gate weave", 8)
-    img = apply_gate_weave(img, 0.5)
+    _progress("Channel misregistration", 8)
+    img = apply_channel_misregistration(img, misreg_str)
 
+    if ca_strength > 0:
+        _progress("Chromatic aberration", 9)
+        img = apply_chromatic_aberration(img, ca_strength)
+
+    # ── Spectral negative → print (sRGB in, sRGB out)
     _progress("Negative → Print conversion", 10)
     img = apply_film_conversion(img, stock)
 
-    _progress("Highlight rolloff", 25)
-    img = apply_highlight_rolloff(img, shoulder=0.82, strength=0.6)
+    # ── Linear-light optical stage: halation + bloom are physical scattering
+    # phenomena and need linear light to behave correctly. Vignette/grain/breath
+    # are perceptually-tuned and stay in sRGB to avoid re-balancing 50 stocks.
+    _progress("Halation", 30)
+    img_lin = _to_linear(img)
+    img_lin = apply_halation(img_lin, stock)
+    _progress("Bloom", 40)
+    img_lin = apply_bloom(img_lin, stock["bloom"])
+    img = _to_srgb(img_lin)
 
-    _progress("Film breath", 35)
-    img = apply_film_breath(img, 0.012)
+    # ── Display-referred grade + tonal compression
+    if grade:
+        _progress("Color grade", 45)
+        img = apply_color_grade(img, grade)
 
-    _progress("Halation", 45)
-    img = apply_halation(img, stock)
+    _progress("Highlight rolloff", 50)
+    img = apply_highlight_rolloff(img, shoulder=rolloff_knee, strength=rolloff_str)
 
-    _progress("Bloom", 55)
-    img = apply_bloom(img, stock["bloom"])
+    _progress("Film breath", 55)
+    img = apply_film_breath(img, breath_str)
 
     _progress("Vignette", 60)
     img = apply_vignette(img, stock["vignette"])
 
+    _progress("Scanner warmth", 65)
+    img = apply_scanner_warmth(img, warmth=scanner_warmth, lift=scanner_lift)
+
+    if light_leak_int > 0:
+        _progress("Light leak", 68)
+        img = apply_light_leak(img, intensity=light_leak_int)
+
     _progress("Volumetric grain", 70)
     img = apply_volumetric_grain(img, stock)
 
+    base_color = stock.get("base_color")  # BGR list/tuple, e.g. instant warm white
+    if base_color is not None:
+        _progress("Film base tint", 85)
+        bc = np.asarray(base_color, dtype=np.float32).reshape(1, 1, 3)
+        # Tint scales with darkness — base color is most visible in shadows
+        # of un-printed reversal/instant stocks, where the emulsion base shows.
+        gray = (0.0722 * img[:, :, 0] + 0.7152 * img[:, :, 1]
+                + 0.2126 * img[:, :, 2])[..., None]
+        weight = (1.0 - gray) * float(stock.get("base_color_strength", 0.08))
+        img = np.clip(img * (1.0 - weight) + bc * weight, 0, 1).astype(np.float32)
+
     if not skip_dust:
         _progress("Dust & artifacts", 88)
-        img = apply_dust_and_artifacts(img, 10)
+        img = apply_dust_and_artifacts(img, dust_amount, stock=stock)
 
     # Quantize to uint8 for display/JPEG; keep a float copy for 16-bit TIFF.
     clean_float = img

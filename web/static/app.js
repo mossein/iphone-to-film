@@ -49,6 +49,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     setupParams();
     setupViews();
     setupBatch();
+    setupGalleryBatch();
+
+    // Pull the initial stock's per-stock baseline values into the Look sliders.
+    syncStockDefaults(S.stock);
 });
 
 /* ─── Helpers ────────────────────────────────────────── */
@@ -111,11 +115,19 @@ async function doUpload(file) {
     const form = new FormData();
     form.append('file', file);
     const resp = await fetch('/api/upload', { method: 'POST', body: form });
+    if (!resp.ok) { alert('Upload failed'); return; }
     const data = await resp.json();
+    if (!data.id) { alert('Upload failed — no image ID returned'); return; }
     S.imageId = data.id;
-    S.imageSrc = URL.createObjectURL(file);
+    // Use server URL (handles HEIC conversion) instead of local blob
+    S.imageSrc = data.url || `/api/original/${data.id}`;
 
-    qs('#img-original').src = S.imageSrc;
+    const origImg = qs('#img-original');
+    origImg.onerror = () => {
+        // Fallback: try object URL if server URL fails
+        origImg.src = URL.createObjectURL(file);
+    };
+    origImg.src = S.imageSrc;
     enterApp('compare');
     requestPreview();
 }
@@ -159,6 +171,37 @@ function selectStock(key, el) {
     // Update compare label
     const info = S.galleryStocks.find(s => s.key === key);
     if (info) qs('#cmp-stock-label').textContent = info.name.toUpperCase();
+
+    // Re-baseline the "Look" sliders to this stock's defaults so "no
+    // override" means "stock as-authored." Drop any existing pipeline-level
+    // overrides — they belonged to the previous stock.
+    syncStockDefaults(key);
+}
+
+async function syncStockDefaults(key) {
+    try {
+        const resp = await fetch(`/api/stock-defaults/${key}`);
+        if (!resp.ok) { if (S.imageId) requestPreview(); return; }
+        const defaults = await resp.json();
+        // Clear pipeline-level overrides — only the photochemical sliders
+        // (exp_comp/sat/etc.) survive a stock change.
+        const photochem = new Set(['exp_comp','sat','pre_flash_neg','black_offset','white_point','tint']);
+        for (const k of Object.keys(S.params)) {
+            if (!photochem.has(k)) delete S.params[k];
+        }
+        // Reset every slider whose data-param is in the defaults dict.
+        qa('.prm').forEach(prm => {
+            const k = prm.dataset.param;
+            if (!(k in defaults)) return;
+            const slider = prm.querySelector('input[type="range"]');
+            const valEl = prm.querySelector('.prm-val');
+            const decimals = parseInt(slider.dataset.decimals || '2');
+            const v = Number(defaults[k]);
+            slider.value = v;
+            slider.dataset.stockDefault = String(v);
+            valEl.textContent = v.toFixed(decimals);
+        });
+    } catch (e) { console.error('stock-defaults sync', e); }
     if (S.imageId) requestPreview();
 }
 
@@ -176,12 +219,15 @@ function setupParams() {
         const slider = prm.querySelector('input[type="range"]');
         const valEl = prm.querySelector('.prm-val');
         const key = prm.dataset.param;
-        const defaultVal = parseFloat(slider.value);
+        // Initial baseline = the slider's HTML default. selectStock() may
+        // overwrite stockDefault when a stock with non-global values is picked.
+        slider.dataset.stockDefault = slider.value;
         const decimals = parseInt(slider.dataset.decimals || '1');
 
         slider.addEventListener('input', () => {
             const val = parseFloat(slider.value);
-            if (Math.abs(val - defaultVal) > 0.001) {
+            const baseline = parseFloat(slider.dataset.stockDefault);
+            if (Math.abs(val - baseline) > 1e-4) {
                 S.params[key] = val;
             } else {
                 delete S.params[key];
@@ -197,6 +243,17 @@ function setupParams() {
     qs('#print-stock').addEventListener('change', e => {
         S.printStock = e.target.value || null;
         if (S.imageId) requestPreview();
+    });
+
+    // Collapsible "Look" section
+    qa('.section-head-toggle').forEach(head => {
+        head.addEventListener('click', () => {
+            const target = qs('#' + head.dataset.toggle);
+            if (!target) return;
+            target.classList.toggle('params-collapsed');
+            const arrow = head.querySelector('.toggle-arrow');
+            if (arrow) arrow.textContent = target.classList.contains('params-collapsed') ? '▾' : '▴';
+        });
     });
 }
 
@@ -214,7 +271,9 @@ async function requestPreview() {
         const resp = await fetch(`/api/preview/${S.imageId}?${p}`);
         if (!resp.ok) throw new Error();
         const url = URL.createObjectURL(await resp.blob());
-        qs('#img-processed').src = url;
+        const img = qs('#img-processed');
+        if (img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
+        img.src = url;
     } catch (e) { console.error('Preview error', e); }
     showLoader(false);
 }
@@ -269,6 +328,7 @@ async function startExport() {
     for (const [k, v] of Object.entries(S.params)) p.set(k, v);
 
     const resp = await fetch(`/api/process?${p}`, { method: 'POST' });
+    if (!resp.ok) { btn.disabled = false; btn.textContent = 'Export Full Resolution'; prog.classList.remove('active'); alert('Export failed'); return; }
     const { job_id } = await resp.json();
 
     const poll = setInterval(async () => {
@@ -413,6 +473,7 @@ function makeGalleryCard(stock, printKey, printLabel) {
     const subtitle = printLabel ? `${stock.category} · ${printLabel}` : stock.category;
     card.innerHTML = `
         <img src="" alt="${stock.name}">
+        <button class="gal-batch-btn" title="Apply to batch of photos">📦</button>
         <div class="gal-info">
             <span class="gal-name">${stock.name}</span>
             <span class="gal-cat">${subtitle}</span>
@@ -434,13 +495,19 @@ function makeGalleryCard(stock, printKey, printLabel) {
         requestPreview();
     });
 
+    card.querySelector('.gal-batch-btn').addEventListener('click', e => {
+        e.stopPropagation();  // don't trigger the card's "open in compare"
+        startGalleryBatch(stock, printKey, printLabel);
+    });
+
     // Lazy-load thumbnail (cancellable)
     const img = card.querySelector('img');
     const printParam = printKey ? `&print_stock=${printKey}` : '';
     const signal = galleryAbort ? galleryAbort.signal : undefined;
     fetch(`/api/thumbnail/${S.imageId}?stock=${stock.key}${printParam}`, { signal })
-        .then(r => r.blob())
+        .then(r => { if (!r.ok) throw new Error(); return r.blob(); })
         .then(blob => {
+            if (img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
             img.src = URL.createObjectURL(blob);
             card.classList.remove('loading');
         })
@@ -450,6 +517,91 @@ function makeGalleryCard(stock, printKey, printLabel) {
 
     return card;
 }
+
+/* ─── Gallery → Batch ────────────────────────────────── */
+// "Apply this look to a batch of photos" — triggered from the 📦 button on
+// each gallery tile. Inherits the recipe of that tile (stock + print) plus
+// any active photochemical / Look slider overrides, applies it to N photos.
+
+let _galBatchPending = null;  // {stock, printKey, printLabel} while file picker is open
+
+function startGalleryBatch(stock, printKey, printLabel) {
+    _galBatchPending = { stock, printKey, printLabel };
+    const inp = qs('#gal-batch-input');
+    inp.value = '';
+    inp.click();
+}
+
+function setupGalleryBatch() {
+    const inp = qs('#gal-batch-input');
+    inp.addEventListener('change', async () => {
+        const files = Array.from(inp.files || []).filter(f => f.size > 0);
+        if (!files.length || !_galBatchPending) return;
+        const ctx = _galBatchPending;
+        _galBatchPending = null;
+        await runGalleryBatch(ctx, files);
+    });
+    qs('#gbp-close').addEventListener('click', () => {
+        qs('#gal-batch-popup').style.display = 'none';
+    });
+}
+
+async function runGalleryBatch({ stock, printKey, printLabel }, files) {
+    const popup = qs('#gal-batch-popup');
+    const recipeEl = qs('#gbp-recipe');
+    const stepEl = qs('#gbp-step');
+    const fill = qs('#gbp-fill');
+    const dl = qs('#gbp-dl');
+
+    popup.style.display = '';
+    dl.style.display = 'none';
+    fill.style.width = '0%';
+    recipeEl.textContent = printLabel ? `${stock.name} · ${printLabel}` : stock.name;
+    stepEl.textContent = `Uploading ${files.length} file${files.length !== 1 ? 's' : ''}…`;
+
+    // Upload
+    const form = new FormData();
+    for (const f of files) form.append('files', f);
+    const upResp = await fetch('/api/batch/upload', { method: 'POST', body: form });
+    if (!upResp.ok) { stepEl.textContent = 'Upload failed'; return; }
+    const upData = await upResp.json();
+    if (!upData.paths || upData.paths.length === 0) {
+        stepEl.textContent = 'No supported files in selection';
+        return;
+    }
+
+    // Build params: this tile's stock+print + any active overrides from S.params
+    const p = new URLSearchParams({ stock: stock.key });
+    if (printKey) p.set('print_stock', printKey);
+    for (const [k, v] of Object.entries(S.params)) p.set(k, v);
+    for (const path of upData.paths) p.append('paths', path);
+
+    stepEl.textContent = 'Processing…';
+    const procResp = await fetch(`/api/batch/process?${p}`, { method: 'POST' });
+    if (!procResp.ok) { stepEl.textContent = 'Process failed'; return; }
+    const { batch_id } = await procResp.json();
+
+    const poll = setInterval(async () => {
+        try {
+            const sr = await fetch(`/api/batch/status/${batch_id}`);
+            const st = await sr.json();
+            fill.style.width = (st.progress || 0) + '%';
+            stepEl.textContent = st.current_file
+                ? `${st.current}/${st.total} — ${st.current_file}`
+                : (st.status === 'done' ? 'Done' : 'Processing…');
+            if (st.status === 'done') {
+                clearInterval(poll);
+                fill.style.width = '100%';
+                dl.href = `/api/batch/download/${batch_id}`;
+                dl.style.display = '';
+            } else if (st.status === 'error') {
+                clearInterval(poll);
+                stepEl.textContent = 'Error: ' + (st.error || 'unknown');
+            }
+        } catch (e) { /* keep polling on transient errors */ }
+    }, 1500);
+}
+
 
 /* ─── Batch ──────────────────────────────────────────── */
 
@@ -509,6 +661,7 @@ async function startBatch() {
     const form = new FormData();
     for (const f of S.batchFiles) form.append('files', f);
     const upResp = await fetch('/api/batch/upload', { method: 'POST', body: form });
+    if (!upResp.ok) { btn.disabled = false; btn.textContent = 'Process All'; alert('Batch upload failed'); return; }
     const upData = await upResp.json();
 
     btn.textContent = 'Processing\u2026';
@@ -519,6 +672,7 @@ async function startBatch() {
     const p = new URLSearchParams({ stock: S.batchStock });
     for (const path of upData.paths) p.append('paths', path);
     const procResp = await fetch(`/api/batch/process?${p}`, { method: 'POST' });
+    if (!procResp.ok) { btn.disabled = false; btn.textContent = 'Process All'; wrap.style.display = 'none'; alert('Batch process failed'); return; }
     const { batch_id } = await procResp.json();
 
     const fill = qs('#batch-fill');

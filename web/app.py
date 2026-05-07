@@ -5,7 +5,8 @@ Run: python -m web.app
 """
 
 import warnings
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=".*colour-science.*")
 
 import sys
 from pathlib import Path
@@ -15,8 +16,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from web._paths import static_dir as _resolve_static
 from web.routes.upload import router as upload_router
 from web.routes.stocks import router as stocks_router
 from web.routes.preview import router as preview_router
@@ -26,8 +29,8 @@ from web.routes.batch import router as batch_router
 
 app = FastAPI(title="Film Emulation")
 
-# Static files
-static_dir = Path(__file__).parent / "static"
+# Static files (resolved at runtime; bundle-aware when frozen)
+static_dir = _resolve_static()
 app.mount("/static", StaticFiles(directory=str(static_dir), html=True), name="static")
 
 # API routes
@@ -39,8 +42,6 @@ app.include_router(gallery_router, prefix="/api")
 app.include_router(batch_router, prefix="/api")
 
 # Serve index.html at root
-from fastapi.responses import FileResponse
-
 @app.get("/")
 async def root():
     return FileResponse(str(static_dir / "index.html"))
