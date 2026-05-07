@@ -7,7 +7,39 @@ I wanted my iPhone photos to look like they were shot on real 35mm film. Not the
 
 Turns out, everyone who's tried this has been doing it wrong. Including me, for the first four attempts.
 
-## The results
+## The new results (v9)
+
+The pipeline below was rewritten end-to-end. Halation and bloom now run in linear light. Halation masks from the red channel (red/IR penetrates film deepest — that's *why* halation reads as red). Grain was rebuilt with separate luma and chroma textures with a chroma-gate that kills the magenta/green speckle in deep shadows. Tone response is midtone-peaked, with grain falling off in both blacks and whites the way actual silver-halide does.
+
+Stocks now expose a per-stock "Look" — halation, bloom, vignette, scanner warmth, light leak, chromatic aberration, scratches, grain amount, and a few more — surfaced as sliders in the web/desktop app and stored as authored defaults per stock. There are also new pushed B&W stocks and 1970s cinema looks. Everything is wired through a CLI, a web app, and a native macOS `.app`.
+
+### Bay Street, Toronto — Kodak 5247 (1970s cinema neg)
+
+Vision3's grandparent. Warm midtones, soft contrast, a halation halo on the bright sky.
+
+![5247](samples/baystreet_5247.jpg)
+
+### Teal wall — Fuji Pro 400H
+
+Cool greens, lifted shadows, the classic editorial Fuji palette.
+
+![fuji400h](samples/teal_fuji400h.jpg)
+
+### Snowboarding — Tri-X 400 pushed
+
+Pushed Tri-X eats highlights and lifts the deep blacks; the sky goes graphite, faces punch.
+
+![trix-push](samples/snowboard_trix_pushed.jpg)
+
+### Hong Kong at night — Tri-X 400 hard push
+
+Hard push for low-light. Gritty grain in the midtones, shadows go properly dense, not muddy.
+
+![trix-hard](samples/hongkong_trix_hardpush.jpg)
+
+---
+
+## Earlier results (v6–v8)
 
 ### Toronto at golden hour
 
@@ -83,7 +115,7 @@ Real film is a **two-stage photochemical process**:
 
 The color crossover in shadows, the highlight rolloff, the way Portra handles skin vs. how Gold handles greens — all of that emerges from light passing through these two photochemical stages. You can't approximate a nonlinear two-stage optical process by dragging RGB sliders around. I tried. Four times.
 
-## The 8-version journey
+## The 9-version journey
 
 I'm not going to pretend I got this right on the first try.
 
@@ -99,25 +131,51 @@ I'm not going to pretend I got this right on the first try.
 
 **v7**: Realized we'd been processing 768×1024 thumbnails from the Photos Library `derivatives` folder this entire time instead of the actual 4032×3024 / 5712×4284 originals. Also replaced bicubic upscaling with Real-ESRGAN AI upscaling. Facepalm moment.
 
-**v8 (current)**: Full-resolution originals, no upscaling needed, optimized pipeline. Profiled every step and found that `film_breath` was taking 168 seconds per image because of a massive Gaussian blur on a 24-megapixel image — for what amounts to a barely-visible low-frequency variation. Generated the effect at 16×16 resolution and upscaled instead. Total processing: ~30 seconds per image down from ~4 minutes.
+**v8**: Full-resolution originals, no upscaling needed. Profiled every step and found that `film_breath` was taking 168 seconds per image because of a massive Gaussian blur on a 24-megapixel image — for what amounts to a barely-visible low-frequency variation. Generated the effect at 16×16 resolution and upscaled instead. Total processing: ~30 seconds per image down from ~4 minutes.
+
+**v9 (current)**: Top-to-bottom audit of every effect. Most of v6–v8's "magic numbers" turned out to be wrong in physically-meaningful ways:
+
+- **Halation and bloom were running in sRGB-encoded space.** Both are *optical scattering* — light bouncing inside the film and lens. Photons don't care about gamma. Moved them to a linear-light stage between the spectral conversion and the final sRGB encode. Bloat in midtones is gone; highlights actually halate the way they should.
+- **Halation was masked from grayscale luma.** Real halation is dominantly red/IR — red photons penetrate the silver-halide layers deepest, hit the film base, and reflect back. A bright blue sky was getting Cinestill-style red glow. Now masked from the red channel; the diagnostic "Cinestill bleed" only fires where it should.
+- **Grain in the shadows was speckled magenta/green** because the chroma component was firing into pure black. Split the texture into a luma channel and a chroma channel; chroma is gated by luminance and silenced below ~6% gray. Tone response peaks at midtones (where film actually has the most grain) and goes to *zero* at pure black and pure white instead of holding a 20% floor.
+- **Gate weave was dropped from stills.** It's a per-frame projector wobble — invisible on a still, but it costs you ~½ pixel of sharpness. Replaced with sub-pixel channel misregistration, which is the cue that actually reads as "film" on a still image.
+- **Halation/bloom radii now scale by `film_format_mm`** instead of being a fixed fraction of the digital frame. Halation on 6×7 is physically smaller relative to frame than on 35mm.
+- **Per-stock "Look" controls.** Acutance, scanner warmth, light leak, chromatic aberration, scratches/hairs, grain amount, highlight rolloff knee/strength, etc. All overridable per stock and exposed as live sliders in the web/desktop app.
+- **An ASC-CDL grade slot** (slope/offset/power per channel + saturation) sits after halation so each stock can express character without baking new spectral LUTs.
+- **Adaptive exposure**: optional auto-print mode that targets a midtone density via histogram percentile, the way a real lab would.
+- **Native RAW in the CLI** via `rawpy` (the web app already had it). `.cr3 / .nef / .arw / .dng / .raf / .rw2 / .orf / .pef / .srw / .x3f` go straight in.
+- **Web UI**: per-stock "Look" sidebar that auto-baselines to the selected stock's authored values; switch to Cinestill 800T and the halation slider jumps to 0.6 because that's what the stock authors. "Apply to batch" button on every gallery tile applies the exact recipe (stock + print + slider state) to N uploaded photos and zips the results.
+- **Native macOS app**: PyInstaller bundle wrapping the FastAPI server in a Cocoa webview window. `dist/Film.app`, double-click, no browser needed.
 
 ## How it actually works
 
-The pipeline, in order:
+The pipeline, in order (sRGB-encoded unless noted):
 
 ```
-iPhone HEIC (full res) → JPEG conversion
-  → Film acutance (MTF simulation — soft high freq, boost mid freq)
-  → Gate weave (random sub-pixel shift + micro rotation)
-  → Negative → Print conversion (spectral_film_lut — the core)
-  → Film breath (low-frequency exposure variation)
-  → Halation (bright highlights bleed warm light into surroundings)
-  → Bloom (soft glow on highlights)
-  → Vignette (natural lens falloff)
-  → Volumetric grain (RMS granularity data from film datasheets, per-channel)
-  → Dust & artifacts
-  → Film border (sprocket holes, frame numbers, stock text)
+load (JPEG / PNG / HEIC / 16-bit TIFF / RAW via rawpy)
+  → Film acutance        (perceptual softening, kills digital crispness)
+  → Channel misregistration  (sub-pixel R/G/B layer offset — film cue on stills)
+  → Chromatic aberration (optional per-stock; cheap radial scale)
+  → Auto-exposure        (optional per-stock; lab-style print density)
+  → Negative → Print     (spectral_film_lut — the core)
+  ┌─ LINEAR LIGHT ───────────────────────────────────────────────┐
+  │  → Halation          (red-channel mask, two-scale point-spread)│
+  │  → Bloom             (linear screen blend on highlights)        │
+  └──────────────────────────────────────────────────────────────┘
+  → ASC-CDL grade        (optional per-stock; slope/offset/power/sat)
+  → Highlight rolloff    (tanh shoulder)
+  → Film breath          (low-freq exposure wobble)
+  → Vignette             (natural lens falloff, scaled per format)
+  → Scanner warmth       (subtle R lift + black-point bleed)
+  → Light leak           (optional per-stock)
+  → Volumetric grain     (luma + chroma-gated; midtone-peak; per-stock RMS)
+  → Film base tint       (optional; reversal/instant warm-white base)
+  → Dust + scratches + hairs
+  → uint8 / 16-bit TIFF
+  → Film border          (35mm gets sprocket holes; medium-format clean)
 ```
+
+`_to_linear` / `_to_srgb` use the piecewise IEC sRGB EOTF/OETF, not pure 2.2 — stays correct in the dark range where the power approximation has the wrong slope.
 
 ### The important bit: spectral_film_lut
 
@@ -143,12 +201,21 @@ When light hits film, some of it passes through the emulsion, bounces off the fi
 
 ## Film stocks
 
+50 stocks across 7 categories — pro color neg, consumer, modern cinema, vintage cinema, B&W, slide/reversal, instant + cross-process. A few highlights:
+
 | Stock | Character | Good for |
 |-------|-----------|----------|
 | **Kodak Portra 400** | Warm skin tones, pastel highlights, lifted shadows, low contrast | Portraits, golden hour, anything with people |
 | **Fuji Pro 400H** | Cooler, green-shifted shadows, airy highlights | Overcast days, editorial, clean/minimal |
 | **Kodak Gold 200** | Punchy, saturated, warm yellows/reds | Travel, daytime, the "nostalgic" look |
 | **Cinestill 800T** | Tungsten-balanced, blue shadows, extreme halation | Night, city lights, neon, moody |
+| **Kodak Vision3 500T / 50D / 250D** | Modern cinema neg | The look behind most films shot since ~2009 |
+| **Kodak 5247 / 5248 / 5277 / 5293** | 1970s–80s cinema | Vintage cinema palette, softer contrast |
+| **Tri-X 400 / Tri-X pushed / hard-pushed** | Classic B&W | Documentary, low-light, gritty street |
+| **Kodachrome 64 / Velvia 50 / Ektachrome** | Slide film | High contrast, deep saturation |
+| **Aerochrome / x-pro variants** | Cross-process & infrared | Surreal greens-to-magenta, vintage-fashion looks |
+
+Each stock pairs a negative emulsion (e.g. `KODAK_PORTRA_400`) with a print (`KODAK_2383`, `FUJI_CA_DPII`, etc.). The web app's Gallery view shows every stock × print combination as a contact sheet.
 
 Cinestill is modeled as Kodak Vision3 500T (`sfl.KODAK_5219`) with tungsten white balance (3200K) and cranked halation.
 
@@ -169,36 +236,18 @@ As an open-source, code-only, runs-from-the-command-line thing? Not really. Most
 ### Dependencies
 
 ```bash
-pip install opencv-python numpy scipy
-pip install git+https://github.com/JanLohse/spectral_film_lut.git
-pip install colour-science numba
+pip install -r requirements.txt
 ```
 
-### Usage
+That covers `fastapi`, `uvicorn`, `opencv-python`, `numpy`, `scipy`, `Pillow`, `pillow-heif`, `rawpy`, `colour-science`, and `spectral_film_lut`. RAW input is handled natively — no need to pre-convert HEIC or RAW.
 
-Edit the `images` dict in `film_process.py` with your own photo paths and stock choices, then:
+### CLI
 
 ```bash
-python film_process.py
+python3 film_process.py samples/aircanada_original.jpg --stocks portra400 cinestill800t trix400
 ```
 
-Outputs bordered + clean JPGs at full resolution. Processing is ~30 seconds per image on Apple Silicon.
-
-### Adding your own photos
-
-```python
-images = {
-    "my_photo": {
-        "path": Path("/path/to/your/photo.jpeg"),
-        "stocks": ["portra400", "cinestill800t"],  # pick any combo
-    },
-}
-```
-
-If your photos are HEIC (iPhone default), convert first:
-```bash
-sips -s format jpeg -s formatOptions 100 input.heic --out output.jpeg
-```
+Outputs bordered + clean JPEGs and a 16-bit TIFF per stock at full resolution. ~30 seconds per image on Apple Silicon. Run `python3 film_process.py --help` for the full stock list.
 
 ### Web app
 
@@ -206,11 +255,11 @@ sips -s format jpeg -s formatOptions 100 input.heic --out output.jpeg
 python3 -m web.app   # http://localhost:8000
 ```
 
-Drag in JPEG / PNG / HEIC / TIFF / RAW (`.cr3`, `.nef`, `.arw`, `.dng`, etc.). Pick a stock, tweak the photochemical and Look sliders, export full-res JPEG + 16-bit TIFF.
+Drag in JPEG / PNG / HEIC / TIFF / RAW (`.cr3`, `.nef`, `.arw`, `.dng`, `.raf`, etc.). Pick a stock; tune the photochemical sliders (exposure, sat, shadow lift, white point, tint) and the per-stock "Look" sliders (halation, bloom, vignette, grain, scanner, light leak, CA, scratches, …). Export full-res JPEG + 16-bit TIFF. The Gallery view contact-sheets every stock × print combination — and each tile has an "Apply to batch" button that processes N uploaded photos with that exact recipe.
 
 ### Desktop app (macOS)
 
-A native `.app` bundle is available — same UI, no browser needed.
+A native `.app` bundle ships the web UI inside a Cocoa webview — same interface, no browser, no terminal.
 
 ```bash
 pip install --break-system-packages pywebview pyinstaller
@@ -218,7 +267,7 @@ pyinstaller film.spec --noconfirm
 open dist/Film.app
 ```
 
-Build details and the rest of the architecture notes live in [CLAUDE.md](CLAUDE.md).
+`Film.app` is ~460 MB (numpy + opencv + scipy + rawpy + spectral_film_lut all bundled). User data lands in `~/Library/Application Support/Film/`. Build details and the rest of the architecture notes live in [CLAUDE.md](CLAUDE.md).
 
 ## What still can't be faked
 
